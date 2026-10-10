@@ -38,6 +38,8 @@ const TRANSFER_IDLE_TIMEOUT = 30000;
 const CHANNEL_OPEN_TIMEOUT = 45000;
 const DEFAULT_TTL = 60 * 60;
 const MAX_TTL = 999 * 60;
+// Keep elapsed time independent of device clock corrections during a session.
+const sessionNow = () => Math.floor(performance.timeOrigin + performance.now());
 let lifetimeEdited = false;
 let filesRenderFrame = null;
 const encoder = new TextEncoder();
@@ -47,6 +49,7 @@ const app = {
   peer: '', peerSecret: '', attempts: [], pairing: null, pakeMessage: null, session: null,
   paired: false, peerReady: false, expiresAt: 0, pairingDeadline: 0,
   localExpiresAt: 0, localPairingDeadline: 0, configuration: null,
+  serverOffset: 0, serverExpiresAt: 0, serverPairingDeadline: 0,
   lifetime: null, lifetimeConfirmed: false,
   connectingAt: 0, remoteCandidates: [],
   clock: 0, files: new Map(), local: new Map(), created: new Set(), expanded: new Set(), replace: null, outgoing: null,
@@ -164,10 +167,10 @@ async function flushControl() {
   try {
     let index = 0;
     while (index < queue.length) {
-      const started = Date.now();
+      const started = sessionNow();
       while (channel.bufferedAmount > 64 * 1024) {
         if (!current(generation) || channel.readyState !== 'open') return;
-        if (Date.now() - started > 30000) throw Error('Folder updates stalled');
+        if (sessionNow() - started > 30000) throw Error('Folder updates stalled');
         await delay(25);
       }
       if (!current(generation) || channel.readyState !== 'open') return;
@@ -230,6 +233,7 @@ function closeSession(message = '') {
   app.configuration = null; app.files.clear(); app.local.clear(); app.created.clear(); app.expanded.clear(); app.replace = null; app.directoryImport = null;
   app.clock = 0; app.paired = app.peerReady = false;
   app.expiresAt = app.pairingDeadline = app.localExpiresAt = app.localPairingDeadline = 0;
+  app.serverOffset = app.serverExpiresAt = app.serverPairingDeadline = 0;
   app.lifetime = null; app.lifetimeConfirmed = false;
   app.connectingAt = 0; app.remoteCandidates = [];
   app.preparingDownload = app.receivingDone = false; app.disconnectedAt = 0;
@@ -245,7 +249,7 @@ function securityFailure() {
   closeSession('Code or confirmation incorrect. Folder closed. Get a new code.');
 }
 function connect(secret, ttl, explicit) {
-  const now = Date.now();
+  const now = sessionNow();
   app.attempts = app.attempts.filter(started => now - started < 120000);
   if (app.attempts.length >= 5) throw Error('Pairing attempt limit reached. Wait two minutes.');
   if (!validSecret(secret) || (!Number.isSafeInteger(ttl) || ttl < 60 || ttl > MAX_TTL)
@@ -262,7 +266,7 @@ function connect(secret, ttl, explicit) {
   // An untouched default permits the peer's choice, even if its code is issued later.
   app.localExpiresAt = now + (explicit ? ttl : MAX_TTL + 120) * 1000;
   app.localPairingDeadline = now + Math.min(120000, ttl * 1000);
-  text('timer', `TTL ${timeLeft((app.localPairingDeadline - Date.now()) / 1000)}`);
+  text('timer', `TTL ${timeLeft((app.localPairingDeadline - sessionNow()) / 1000)}`);
   busy(true); status('Connecting');
   hidden('entry', false); hidden('waiting', false); hidden('code', false); disableButton(element('copy'), true);
   ws.onopen = () => { if (current(generation)) { try { wsSend({ type: 'create', ttl, ttl_explicit: explicit }); } catch { closeSession('Could not open session'); } } };
@@ -275,6 +279,7 @@ function connect(secret, ttl, explicit) {
       if (current(generation)) await handleServer(JSON.parse(event.data), generation);
     }).catch(error => {
       if (!current(generation)) return;
+      console.error('Session message rejected:', error);
       if (error instanceof WebRTCError) closeSession(error.message);
       else securityFailure();
     });
@@ -285,11 +290,16 @@ function connect(secret, ttl, explicit) {
 async function handleServer(value, generation) {
   switch (value?.type) {
     case 'ready': {
-      const now = Date.now();
-      if (!validRoom(value.room) || app.room || !Number.isFinite(value.expires_at)
-        || !Number.isFinite(value.pairing_deadline) || value.pairing_deadline <= now
-        || value.expires_at < value.pairing_deadline || value.pairing_deadline - now > 120000) throw Error('Invalid session context');
-      app.room = value.room; app.expiresAt = value.expires_at; app.pairingDeadline = value.pairing_deadline;
+      if (!validRoom(value.room) || app.room || !positive(value.expires_at)
+        || !positive(value.pairing_deadline)
+        || value.expires_at - value.pairing_deadline !== Math.max(0, app.lifetime.ttl - 120) * 1000) throw Error('Invalid session context');
+      // Map server timestamps to the local request start, conservatively counting transit time.
+      app.serverOffset = value.expires_at - app.lifetime.expires_at;
+      app.serverExpiresAt = value.expires_at; app.serverPairingDeadline = value.pairing_deadline;
+      app.room = value.room;
+      app.expiresAt = value.expires_at - app.serverOffset;
+      app.pairingDeadline = value.pairing_deadline - app.serverOffset;
+      app.lifetime.expires_at = value.expires_at;
       app.configuration = { iceServers: value.ice_servers || [], iceTransportPolicy: value.relay_only === true ? 'relay' : 'all' };
       const code = app.room + app.secret;
       showCode(code); hidden('code', false);
@@ -299,17 +309,18 @@ async function handleServer(value, generation) {
     case 'peer_ready': {
       const role = app.room < app.peer ? 'a' : 'b';
       if (app.peerReady || !app.peer || value.peer !== app.peer || value.role !== role
-        || !Number.isFinite(value.expires_at) || !Number.isFinite(value.pairing_deadline)
-        || value.expires_at > (app.lifetime.explicit ? app.expiresAt : app.localExpiresAt)
-        || value.pairing_deadline > app.pairingDeadline
-        || Math.min(value.pairing_deadline, app.localPairingDeadline) <= Date.now()
+        || !positive(value.expires_at) || !positive(value.pairing_deadline)
+        || value.expires_at > (app.lifetime.explicit ? app.serverExpiresAt : app.localExpiresAt + app.serverOffset)
+        || value.pairing_deadline > app.serverPairingDeadline
+        || Math.min(value.pairing_deadline - app.serverOffset, app.localPairingDeadline) <= sessionNow()
         || value.expires_at < value.pairing_deadline) throw Error('Invalid pairing context');
       app.peerReady = true;
       const args = role === 'a' ? [app.room, app.peer, app.secret, app.peerSecret] : [app.peer, app.room, app.peerSecret, app.secret];
       const result = await Pairing.create(role, args[0], args[1], value.attempt, args[2], args[3]);
       if (!current(generation)) { result.message.fill(0); result.pairing.destroy?.(); return; }
       app.role = role; app.pairing = result.pairing; app.pakeMessage = result.message;
-      app.expiresAt = value.expires_at; app.pairingDeadline = value.pairing_deadline;
+      app.expiresAt = value.expires_at - app.serverOffset;
+      app.pairingDeadline = value.pairing_deadline - app.serverOffset;
       status('Verifying codes');
       wsSend({ type: 'relay', payload: JSON.stringify({ type: 'pake', bytes: Array.from(result.message) }) }); break;
     }
@@ -335,8 +346,8 @@ async function handleServer(value, generation) {
   }
 }
 async function handlePairing(payload, generation) {
-  if (Date.now() >= Math.min(app.pairingDeadline, app.localPairingDeadline)
-    || Date.now() >= Math.min(app.expiresAt, app.localExpiresAt)) {
+  if (sessionNow() >= Math.min(app.pairingDeadline, app.localPairingDeadline)
+    || sessionNow() >= Math.min(app.expiresAt, app.localExpiresAt)) {
     tryWs({ type: 'invalidate' }); closeSession('Pairing expired. Get a new code.'); return;
   }
   const value = JSON.parse(payload);
@@ -385,7 +396,7 @@ function setupPeer() {
     switch (pc.connectionState) {
       case 'failed': case 'closed': closeSession('Connection lost. Get a new code.'); break;
       case 'disconnected':
-        app.disconnectedAt = Date.now(); status('Connection interrupted'); text('route', 'reconnecting'); renderFiles(); break;
+        app.disconnectedAt = sessionNow(); status('Connection interrupted'); text('route', 'reconnecting'); renderFiles(); break;
       case 'connected':
         app.disconnectedAt = 0; status('Both devices online', 'connected'); renderFiles(); updateRoute(pc, generation).catch(() => {}); break;
     }
@@ -434,10 +445,10 @@ async function handleSignal(value, generation) {
       : !own.explicit && value.explicit ? value.expires_at
       : Math.min(own.expires_at, value.expires_at);
     // Both browsers apply the same authenticated preferences; the server cannot extend them.
-    app.expiresAt = app.localExpiresAt = Math.min(app.expiresAt, app.localExpiresAt, expiry);
-    if (app.expiresAt <= Date.now()) throw Error('Folder expired. Temporary state cleared.');
+    app.expiresAt = app.localExpiresAt = Math.min(app.expiresAt, app.localExpiresAt, expiry - app.serverOffset);
+    if (app.expiresAt <= sessionNow()) throw Error('Folder expired. Temporary state cleared.');
     app.lifetimeConfirmed = true;
-    app.connectingAt = Date.now();
+    app.connectingAt = sessionNow();
     status('Opening auth channel'); tick(); wsSend({ type: 'paired' });
     if (app.role === 'a') await createOffer(generation);
     return;
@@ -499,7 +510,7 @@ function attachChannel(channel) {
   if (channel.readyState === 'open') channelReady();
 }
 function channelReady() {
-  if (!app.paired || !app.lifetimeConfirmed || Date.now() >= Math.min(app.expiresAt, app.localExpiresAt) || !app.pc?.remoteDescription) { securityFailure(); return; }
+  if (!app.paired || !app.lifetimeConfirmed || sessionNow() >= Math.min(app.expiresAt, app.localExpiresAt) || !app.pc?.remoteDescription) { securityFailure(); return; }
   app.connectingAt = 0;
   status('Both devices online', 'connected'); tick(); hidden('folder', false); notice('');
   renderFiles(); sendInventory();
@@ -597,7 +608,7 @@ function handleControl(value, generation) {
         const file = app.local.get(value.id);
         if (!file) throw Error('Source unavailable');
         app.outgoing = { transfer: value.transfer, file, offset: 0, size: entry.size, busy: false,
-          started: Date.now(), activity: Date.now() };
+          started: sessionNow(), activity: sessionNow() };
         controlSend({ type: 'start', transfer: value.transfer, id: value.id, version: value.version, size: entry.size });
         transferProgress(false);
       } catch (error) {
@@ -612,13 +623,13 @@ function handleControl(value, generation) {
       if (receiver.id !== value.id || receiver.version !== value.version || receiver.size !== value.size
         || receiver.offset !== 0 || receiver.startedAck) throw Error('Invalid transfer start');
       receiver.startedAck = true;
-      receiver.activity = Date.now();
+      receiver.activity = sessionNow();
       try { controlSend({ type: 'ack', transfer: value.transfer }); } catch { clearTransfer('Transfer failed'); }
       break;
     }
     case 'ack':
       if (app.outgoing?.transfer !== value.transfer || app.outgoing.busy) return;
-      app.outgoing.activity = Date.now();
+      app.outgoing.activity = sessionNow();
       sendChunk(value.transfer, generation).catch(error => {
         if (current(generation) && app.outgoing?.transfer === value.transfer) {
           tryControl({ type: 'cancel', transfer: value.transfer }); cancelOne(value.transfer, errorText(error));
@@ -662,10 +673,10 @@ async function sendChunk(transfer, generation) {
   if (!current(generation) || app.outgoing !== sender) return;
   const channel = app.channel;
   if (!channel) throw Error('Channel closed');
-  const started = Date.now();
+  const started = sessionNow();
   while (channel.bufferedAmount > 64 * 1024) {
     if (!current(generation) || app.outgoing !== sender) return;
-    if (Date.now() - started > 30000) throw Error('Transfer is not responding');
+    if (sessionNow() - started > 30000) throw Error('Transfer is not responding');
     await delay(20);
   }
   if (!current(generation) || app.outgoing !== sender) return;
@@ -674,7 +685,7 @@ async function sendChunk(transfer, generation) {
   packet.set(encoder.encode(transfer));
   new DataView(packet.buffer).setBigUint64(32, BigInt(offset), false);
   packet.set(new Uint8Array(bytes), 40); channel.send(packet.buffer);
-  sender.offset = end; sender.busy = false; sender.activity = Date.now(); transferProgress(false);
+  sender.offset = end; sender.busy = false; sender.activity = sessionNow(); transferProgress(false);
 }
 async function receiveChunk(buffer, generation) {
   if (!current(generation)) return;
@@ -708,7 +719,7 @@ async function receiveChunk(buffer, generation) {
     }
     receiver.chunks.push(bytes);
   }
-  receiver.offset += length; receiver.busy = false; receiver.activity = Date.now(); transferProgress(true);
+  receiver.offset += length; receiver.busy = false; receiver.activity = sessionNow(); transferProgress(true);
   try { controlSend({ type: 'ack', transfer }); } catch { clearTransfer('Connection lost'); }
 }
 async function finishDownload(transfer, generation) {
@@ -766,7 +777,7 @@ function downloadFile(id) {
       const transfer = randomId();
       app.incoming = { transfer, name: file.name, id, version: file.version, size: file.size,
         offset: 0, download: downloader, chunks: [], busy: false, startedAck: false,
-        started: Date.now(), activity: Date.now() };
+        started: sessionNow(), activity: sessionNow() };
       try { controlSend({ type: 'get', transfer, id, version: file.version }); }
       catch (error) { cancelOne(transfer, 'Source unavailable'); throw error; }
       transferProgress(true); notice('');
@@ -803,8 +814,8 @@ function receiveFolderFile(entry, writer, job) {
   return new Promise((resolve, reject) => {
     const transfer = randomId();
     app.incoming = { transfer, name: entry.name, id: entry.id, version: entry.version, size: entry.size,
-      offset: 0, writer, chunks: [], busy: false, startedAck: false, started: Date.now(),
-      activity: Date.now(), folder: job, entry, resolve, reject };
+      offset: 0, writer, chunks: [], busy: false, startedAck: false, started: sessionNow(),
+      activity: sessionNow(), folder: job, entry, resolve, reject };
     try { controlSend({ type: 'get', transfer, id: entry.id, version: entry.version }); }
     catch (error) { cancelOne(transfer, errorText(error)); }
     transferProgress(true);
@@ -828,7 +839,7 @@ async function downloadFolder(id) {
     if (entryKind(entry) === 'file' && entry.owner === app.role && !app.local.has(entry.id)) throw Error('File source unavailable');
   }
   const job = { generation: app.generation, cancelled: false, writer: null,
-    progress: { name: root.name, size: 0, offset: 0, started: Date.now() } };
+    progress: { name: root.name, size: 0, offset: 0, started: sessionNow() } };
   app.folderDownload = job;
   try {
     // Open the destination picker while the button click still has user activation.
@@ -856,7 +867,7 @@ async function downloadFolder(id) {
       checkFolderDownload(job, entry);
       const local = app.local.get(entry.id);
       if (local) {
-        job.progress = { name: entry.name, size: entry.size, offset: 0, started: Date.now() };
+        job.progress = { name: entry.name, size: entry.size, offset: 0, started: sessionNow() };
         transferProgress(true);
         for (let offset = 0; offset < entry.size; offset += CHUNK) {
           const end = Math.min(offset + CHUNK, entry.size);
@@ -889,7 +900,7 @@ function transferProgress(receiving) {
   const transfer = receiving ? app.incoming || app.folderDownload?.progress : app.outgoing;
   if (!transfer) return;
   const { offset, size, started } = transfer;
-  const elapsed = Math.max((Date.now() - started) / 1000, 0.001);
+  const elapsed = Math.max((sessionNow() - started) / 1000, 0.001);
   const speed = offset / elapsed;
   const percentage = size === 0 ? 100 : 100 * offset / size;
   hidden('transfer', false);
@@ -1103,16 +1114,16 @@ function importDirectory(files, context) {
   if (entries.length) commitFolder(entries, generation, replacement);
 }
 function tick() {
-  if (app.connectingAt && Date.now() - app.connectingAt > CHANNEL_OPEN_TIMEOUT) {
+  if (app.connectingAt && sessionNow() - app.connectingAt > CHANNEL_OPEN_TIMEOUT) {
     closeSession('WebRTC connection timed out. Check network or TURN.'); return;
   }
-  if (app.disconnectedAt && Date.now() - app.disconnectedAt > 30000) { closeSession('Connection not restored. Folder closed.'); return; }
+  if (app.disconnectedAt && sessionNow() - app.disconnectedAt > 30000) { closeSession('Connection not restored. Folder closed.'); return; }
   if (app.incoming?.download?.cancelled) {
     const transfer = app.incoming.transfer; tryControl({ type: 'cancel', transfer }); cancelOne(transfer, 'Download cancelled in browser');
   }
   for (const direction of ['incoming', 'outgoing']) {
     const transfer = app[direction];
-    if (transfer && !transfer.busy && Date.now() - transfer.activity > TRANSFER_IDLE_TIMEOUT) {
+    if (transfer && !transfer.busy && sessionNow() - transfer.activity > TRANSFER_IDLE_TIMEOUT) {
       tryControl({ type: 'cancel', transfer: transfer.transfer });
       cancelOne(transfer.transfer, direction === 'incoming' ? 'File source is not responding' : 'File destination is not responding');
     }
@@ -1120,16 +1131,16 @@ function tick() {
   const expires = Math.min(app.expiresAt, app.localExpiresAt);
   const deadline = Math.min(app.pairingDeadline, app.localPairingDeadline);
   // Apply local bounds even while a server never sends its initial response.
-  if (app.ws && Date.now() >= app.localExpiresAt) { closeSession('Folder expired. Temporary state cleared.'); return; }
-  if (app.ws && !app.lifetimeConfirmed && Date.now() >= app.localPairingDeadline) {
+  if (app.ws && sessionNow() >= app.localExpiresAt) { closeSession('Folder expired. Temporary state cleared.'); return; }
+  if (app.ws && !app.lifetimeConfirmed && sessionNow() >= app.localPairingDeadline) {
     tryWs({ type: 'invalidate' }); closeSession('Code expired. Get a new code.'); return;
   }
   if (!expires) return;
-  if (Date.now() >= expires) { closeSession('Folder expired. Temporary state cleared.'); return; }
-  if (!app.lifetimeConfirmed && Date.now() >= deadline) { tryWs({ type: 'invalidate' }); closeSession('Code expired. Get a new code.'); return; }
+  if (sessionNow() >= expires) { closeSession('Folder expired. Temporary state cleared.'); return; }
+  if (!app.lifetimeConfirmed && sessionNow() >= deadline) { tryWs({ type: 'invalidate' }); closeSession('Code expired. Get a new code.'); return; }
   text('timer', app.lifetimeConfirmed
-    ? `TTL ${timeLeft((expires - Date.now()) / 1000)}`
-    : `TTL ${timeLeft((deadline - Date.now()) / 1000)}`);
+    ? `TTL ${timeLeft((expires - sessionNow()) / 1000)}`
+    : `TTL ${timeLeft((deadline - sessionNow()) / 1000)}`);
 }
 function listen(id, event, handler) {
   element(id).addEventListener(event, value => {
@@ -1169,7 +1180,7 @@ listen('join', 'click', () => {
   if (!code) throw Error('Enter an eight-character code.');
   const peer = code.slice(0, 3), secret = code.slice(3);
   if (!app.room || app.peer || app.room === peer) throw Error("Get your code first, then enter the other device's code once.");
-  if (Date.now() >= Math.min(app.pairingDeadline, app.localPairingDeadline)) throw Error('Your code has expired. Get a new code.');
+  if (sessionNow() >= Math.min(app.pairingDeadline, app.localPairingDeadline)) throw Error('Your code has expired. Get a new code.');
   app.peer = peer; app.peerSecret = secret; clearJoinCode(); disableButton(element('join'), true);
   wsSend({ type: 'select', peer }); status('Waiting other device');
 });
