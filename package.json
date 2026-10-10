@@ -1,0 +1,14 @@
+{
+  "name": "farshift-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "esbuild web/app.js --bundle --format=esm --target=es2022 --outfile=/out/web/app.js && cp web/index.html web/style.css web/grid.js web/sw.js /out/web/"
+  },
+  "dependencies": {
+    "@noble/curves": "2.4.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}

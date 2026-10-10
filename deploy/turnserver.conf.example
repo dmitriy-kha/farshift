@@ -1,0 +1,43 @@
+# Copy to /etc/turnserver.conf. Replace the hostname and secret.
+# FARSHIFT_TURN_SECRET must match static-auth-secret. Use a random 32-byte secret.
+listening-port=3478
+fingerprint
+use-auth-secret
+static-auth-secret=REPLACE_WITH_RANDOM_SECRET
+realm=turn.example.org
+server-name=turn.example.org
+# Use the public IP here if the server has several interfaces or is behind NAT.
+# listening-ip=203.0.113.10
+# relay-ip=203.0.113.10
+# external-ip=203.0.113.10
+min-port=49160
+max-port=49259
+user-quota=4
+total-quota=64
+max-bps=5242880
+bps-capacity=52428800
+max-allocate-lifetime=600
+no-cli
+no-multicast-peers
+no-tcp-relay
+# UDP/TCP TURN on 3478 works. WebRTC encrypts the relayed data with DTLS.
+# For TURN over TLS also configure cert/pkey and FARSHIFT_TURN_URLS=turns:...:5349.
+no-tls
+no-dtls
+# Block private networks and metadata endpoints. Loopback is denied by default.
+denied-peer-ip=0.0.0.0-0.255.255.255
+denied-peer-ip=10.0.0.0-10.255.255.255
+denied-peer-ip=100.64.0.0-100.127.255.255
+denied-peer-ip=127.0.0.0-127.255.255.255
+denied-peer-ip=169.254.0.0-169.254.255.255
+denied-peer-ip=172.16.0.0-172.31.255.255
+denied-peer-ip=192.168.0.0-192.168.255.255
+denied-peer-ip=224.0.0.0-255.255.255.255
+denied-peer-ip=::
+denied-peer-ip=::1
+denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+denied-peer-ip=ff00::-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+# Disable coturn request logging. Do not enable verbose or log-binding.
+no-stdout-log
+log-file=/dev/null

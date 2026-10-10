@@ -1,0 +1,17 @@
+[package]
+name = "farshift-server"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+getrandom = "0.2"
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tower-http = { version = "0.6", features = ["fs", "set-header"] }
+hmac = "0.12"
+sha1 = "0.10"
+base64 = "0.22"

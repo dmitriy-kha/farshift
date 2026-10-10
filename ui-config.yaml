@@ -1,0 +1,10 @@
+# Animation timings in milliseconds. Reload the page after editing.
+# Each code symbol waits: code_min_delay_ms + random(0, code_random_range_ms).
+code_min_delay_ms: 30
+code_random_range_ms: 100
+# How often the browser checks which symbols need changing.
+code_tick_ms: 50
+# Random single-dot blinking while ready to connect.
+indicator_ready_ms: 180
+# Clockwise single-dot rotation while waiting for the peer.
+indicator_waiting_ms: 120

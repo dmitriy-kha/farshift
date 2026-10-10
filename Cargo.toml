@@ -1,0 +1,15 @@
+[workspace]
+members = ["server"]
+default-members = ["server"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+rust-version = "1.85"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

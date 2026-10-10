@@ -1,0 +1,160 @@
+name: farshift
+
+services:
+  # Pairing state lives in RAM; run one app replica.
+  app:
+    image: ${FARSHIFT_IMAGE:?Set FARSHIFT_IMAGE to a published image digest}
+    restart: unless-stopped
+    init: true
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      FARSHIFT_ORIGIN: https://${FARSHIFT_DOMAIN:?Set FARSHIFT_DOMAIN in deploy/.env}
+      FARSHIFT_STUN_URLS: ${FARSHIFT_STUN_URLS-stun:stun.cloudflare.com:3478}
+      FARSHIFT_TURN_URLS: ${FARSHIFT_TURN_URLS:-}
+      FARSHIFT_TURN_SECRET: ${FARSHIFT_TURN_SECRET:-}
+      FARSHIFT_RELAY_ONLY: ${FARSHIFT_RELAY_ONLY:-0}
+      FARSHIFT_MAX_ROOMS: ${FARSHIFT_MAX_ROOMS:-32768}
+      FARSHIFT_MAX_CONNECTIONS: ${FARSHIFT_MAX_CONNECTIONS:-32768}
+
+  nginx:
+    image: ${FARSHIFT_NGINX_IMAGE:?Set FARSHIFT_NGINX_IMAGE to a published image digest}
+    restart: unless-stopped
+    init: true
+    stop_signal: SIGTERM
+    stop_grace_period: 30s
+    ulimits:
+      nofile:
+        soft: 131072
+        hard: 131072
+    sysctls:
+      net.ipv4.ip_local_port_range: "1024 65535"
+    depends_on:
+      app:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        sed -i 's/worker_connections[[:space:]]*[0-9]*;/worker_connections 131072;/' /etc/nginx/nginx.conf
+
+        certificate_fingerprint() {
+          [ -s /etc/nginx/certs/key.pem ] && [ -s /etc/nginx/certs/fullchain.pem ] || return 1
+          (cd /etc/nginx/certs && sha256sum key.pem fullchain.pem)
+        }
+        committed_certificate() {
+          marker=$$(cat /etc/nginx/certs/ready 2>/dev/null) || return 1
+          fingerprint=$$(certificate_fingerprint) || return 1
+          [ -n "$$marker" ] && [ "$$marker" = "$$fingerprint" ] || return 1
+          printf '%s\n' "$$marker"
+        }
+
+        applied=''
+        cp /etc/nginx/farshift-http.conf /etc/nginx/conf.d/default.conf
+        if fingerprint=$$(certificate_fingerprint 2>/dev/null); then
+          cp /etc/nginx/farshift.conf /etc/nginx/conf.d/default.conf
+          if nginx -t; then
+            applied=$$fingerprint
+          else
+            cp /etc/nginx/farshift-http.conf /etc/nginx/conf.d/default.conf
+          fi
+        fi
+        nginx -g 'daemon off;' &
+        nginx_pid=$$!
+        sleep_pid=''
+        shutdown() {
+          trap - TERM INT
+          [ -z "$$sleep_pid" ] || kill "$$sleep_pid" 2>/dev/null || true
+          kill -QUIT "$$nginx_pid" 2>/dev/null || true
+          wait "$$nginx_pid" || true
+          exit 0
+        }
+        trap shutdown TERM INT
+        while kill -0 "$$nginx_pid" 2>/dev/null; do
+          next=$$(committed_certificate 2>/dev/null || true)
+          if [ -n "$$next" ] && [ "$$next" != "$$applied" ]; then
+            cp /etc/nginx/farshift.conf /etc/nginx/conf.d/default.conf
+            if nginx -t && nginx -s reload; then
+              applied=$$next
+            else
+              printf '%s\n' 'Certificate reload failed; keeping the running configuration' >&2
+            fi
+          fi
+          sleep 5 &
+          sleep_pid=$$!
+          wait "$$sleep_pid" || true
+          sleep_pid=''
+        done
+        wait "$$nginx_pid"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- --no-check-certificate https://127.0.0.1/health | grep -qx ok"]
+      interval: 30s
+      timeout: 5s
+      start_period: 120s
+      retries: 3
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/farshift.conf:ro
+      - ./nginx-http.conf:/etc/nginx/farshift-http.conf:ro
+      - /opt/farshift/data/certificates:/etc/nginx/certs:ro
+      - /opt/farshift/data/challenges:/var/www/acme:ro
+
+  acme:
+    image: ${FARSHIFT_ACME_IMAGE:?Set FARSHIFT_ACME_IMAGE to a published image digest}
+    restart: unless-stopped
+    init: true
+    depends_on:
+      nginx:
+        condition: service_started
+    environment:
+      FARSHIFT_DOMAIN: ${FARSHIFT_DOMAIN:?Set FARSHIFT_DOMAIN in deploy/.env}
+      FARSHIFT_ACME_EMAIL: ${FARSHIFT_ACME_EMAIL:?Set FARSHIFT_ACME_EMAIL in deploy/.env}
+      AUTO_UPGRADE: "0"
+      ACME_PACKAGED: "1"
+      TZ: UTC
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        umask 077
+        chmod 700 /acme.sh
+        # HTTP-01 tokens are public and must be readable by the Nginx worker.
+        chmod 755 /var/www/acme
+        if ! printf '%s\n' "$$FARSHIFT_DOMAIN" | awk -F . '
+          NR != 1 || NF < 2 || length($$0) > 253 { exit 1 }
+          { for (i = 1; i <= NF; i++) if (length($$i) > 63 || $$i !~ /^[a-z0-9][a-z0-9-]*$$/ || $$i ~ /-$$/) exit 1 }
+        '; then
+          printf '%s\n' 'FARSHIFT_DOMAIN must be a lowercase DNS hostname' >&2
+          exit 1
+        fi
+        domain_config="/acme.sh/$${FARSHIFT_DOMAIN}_ecc/$${FARSHIFT_DOMAIN}.conf"
+        if [ -f "$$domain_config" ]; then
+          sed -i "/^Le_DeployHook='docker,*'$$/d" "$$domain_config"
+        fi
+        acme.sh --issue --server letsencrypt --accountemail "$$FARSHIFT_ACME_EMAIL" \
+          --webroot /var/www/acme -d "$$FARSHIFT_DOMAIN" --keylength ec-256 \
+          || { code=$$?; [ "$$code" -eq 2 ] || exit "$$code"; }
+        acme.sh --install-cert -d "$$FARSHIFT_DOMAIN" --ecc \
+          --key-file /certificates/key.pem --fullchain-file /certificates/fullchain.pem \
+          --reloadcmd 'cd /certificates && sha256sum key.pem fullchain.pem > ready.tmp && mv ready.tmp ready'
+        if [ ! -f /acme.sh/crontab ]; then
+          timestamp=$$(date -u +%s)
+          minute=$$((timestamp % 60))
+          hour=$$((timestamp / 60 % 6))
+          printf '%s %s,%s,%s,%s * * * /acmebin/acme.sh --cron --home /acmebin --config-home /acme.sh\n' \
+            "$$minute" "$$hour" "$$((hour + 6))" "$$((hour + 12))" "$$((hour + 18))" > /acme.sh/crontab
+        fi
+        cp /acme.sh/crontab /etc/crontabs/root
+        chmod 600 /acme.sh/crontab /etc/crontabs/root
+        exec /usr/sbin/crond -f -d 8 -c /etc/crontabs
+    volumes:
+      - /opt/farshift/data/challenges:/var/www/acme
+      - /opt/farshift/data/acme:/acme.sh
+      - /opt/farshift/data/certificates:/certificates

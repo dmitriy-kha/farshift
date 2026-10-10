@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>farshift — temporary folder</title>
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/grid.js"></script>
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <main id="screen" class="window" aria-label="Temporary shared folder">
+    <div class="body">
+      <div class="topline"><span class="led" id="led" aria-hidden="true">⠁</span><span id="status">Loading</span><span class="topline-actions"><button id="toggle-grid" tabindex="-1" aria-pressed="false" title="Show character grid">grid:off</button><span id="timer">TTL --:--</span></span></div>
+      <div id="content">
+      <section id="entry">
+        <div class="create-row"><label for="ttl">Life</label><input id="ttl" class="cell-input" type="text" inputmode="numeric" pattern="[0-9]{1,3}" maxlength="3" value="60" autocomplete="off" aria-label="Lifetime in minutes"><span id="ttl-unit" class="muted">m.</span><button id="create" aria-disabled="true">get code</button></div>
+      </section>
+      <section id="waiting">
+        <div id="code" class="code" tabindex="-1" data-ready="false"><span id="code-left"></span><span id="code-right"></span></div>
+        <div class="actions"><button id="copy" aria-disabled="true">copy code</button></div>
+        <div class="join-row"><input id="join-code" class="cell-input" type="text" inputmode="text" maxlength="9" value="    -" autocomplete="off" autocapitalize="characters" spellcheck="false" aria-label="Eight-character peer code"><button id="join" aria-disabled="true">enter code</button></div>
+      </section>
+      <section id="folder" hidden>
+        <div id="files"><p class="empty">Folder empty</p></div>
+        <div id="transfer" hidden><div class="transfer-top"><span id="transfer-label"></span><button id="cancel-transfer">cancel</button></div><progress id="progress" value="0" max="100"></progress><div class="muted" id="progress-text"></div></div>
+      </section>
+      </div>
+      <div class="folder-head"><button id="add-folder">add folder</button><label class="button" for="add-files" role="button" tabindex="0">add</label><input id="add-files" type="file" multiple hidden><input id="add-directory" type="file" webkitdirectory multiple hidden></div>
+      <div class="route">route: <span id="route">detecting</span></div>
+      <div id="hotkeys" class="hotkeys" aria-label="Keyboard shortcuts"><div class="hotkeys-track"><span>h ←  j ↓  k ↑  l →  Tab next  Shift+Tab previous  Enter activate  q delete  d download  r replace</span><span aria-hidden="true">h ←  j ↓  k ↑  l →  Tab next  Shift+Tab previous  Enter activate  q delete  d download  r replace</span></div></div>
+      <h1 id="tagline">Two Devices. One Folder.</h1>
+      <div class="session-actions" id="session-actions"><button id="leave">close folder</button></div>
+    </div>
+    <p id="notice" role="status" hidden></p>
+  </main>
+  <input type="file" id="replace-file" hidden>
+</body>
+</html>

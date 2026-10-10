@@ -1,0 +1,11 @@
+---
+colorpallet:
+  maintheme:
+    - 3: '#737373'
+      2: '#595959'
+      1: '#404040'
+      0: '#262626'
+  accents:
+    # Standard Neovim colors for text on dark backgrounds.
+    green: '#B3F6C0'
+    yellow: '#FCE094'
