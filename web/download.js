@@ -1,5 +1,5 @@
 // Bounded page-to-worker bridge; file data is never accumulated here.
-const CHUNK_LIMIT = 16 * 1024;
+import { WRITE_BATCH as CHUNK_LIMIT } from './transfer-config.js';
 let ready = false;
 let preparation;
 async function timeout(promise, milliseconds) {
@@ -33,7 +33,7 @@ export async function prepare() {
 function available() { return ready && Boolean(navigator.serviceWorker?.controller); }
 export class Download {
   constructor(port, token) {
-    Object.assign(this, { port, token, pending: null, cancelled: false, finished: false, frame: null, heartbeat: null, failure: null });
+    Object.assign(this, { port, token, pending: null, chunkLimit: 16 * 1024, cancelled: false, finished: false, frame: null, heartbeat: null, failure: null });
     port.onmessage = event => {
       const kind = event.data?.type;
       if (kind === 'pong') return;
@@ -44,6 +44,13 @@ export class Download {
       if (!this.pending || kind !== this.pending.expected) {
         this.abort('Unexpected download acknowledgement');
         return;
+      }
+      if (kind === 'ready' && event.data.chunk_limit !== undefined) {
+        const limit = event.data.chunk_limit;
+        if (!Number.isSafeInteger(limit) || limit < 16 * 1024 || limit > CHUNK_LIMIT || limit % (16 * 1024)) {
+          this.abort('Invalid download batch limit'); return;
+        }
+        this.chunkLimit = limit;
       }
       const pending = this.pending;
       this.pending = null;
@@ -96,9 +103,11 @@ export class Download {
   }
   async push(bytes) {
     if (!(bytes instanceof Uint8Array) || !bytes.length || bytes.length > CHUNK_LIMIT) throw new Error('Invalid chunk size');
-    // Preserve the caller's bytes; only the bounded independent copy is detached.
-    const buffer = bytes.slice().buffer;
-    await this.request('ack', () => this.port.postMessage({ type: 'chunk', bytes: buffer }, [buffer]));
+    // Respect the active worker's batch limit while an updated worker is installing.
+    for (let offset = 0; offset < bytes.length; offset += this.chunkLimit) {
+      const buffer = bytes.slice(offset, offset + this.chunkLimit).buffer;
+      await this.request('ack', () => this.port.postMessage({ type: 'chunk', bytes: buffer }, [buffer]));
+    }
   }
   async finish() {
     await this.request('done', () => this.port.postMessage({ type: 'end' }));

@@ -1,5 +1,5 @@
 // Ephemeral streaming downloads only: no caching or whole-file buffering.
-const CHUNK_LIMIT = 16 * 1024;
+import { WRITE_BATCH as CHUNK_LIMIT } from './transfer-config.js';
 const sessions = new Map();
 let timer;
 function onlyFields(data, keys) {
@@ -7,7 +7,9 @@ function onlyFields(data, keys) {
     Object.keys(data).every(key => keys.includes(key));
 }
 function post(session, type, message) {
-  try { session.port.postMessage(message ? { type, message } : { type }); } catch { /* Closed port. */ }
+  const data = message ? { type, message } : { type };
+  if (type === 'ready') data.chunk_limit = CHUNK_LIMIT;
+  try { session.port.postMessage(data); } catch { /* Closed port. */ }
 }
 function terminate(session, type, message = 'Download cancelled') {
   if (session.terminal) return;

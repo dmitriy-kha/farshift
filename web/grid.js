@@ -87,7 +87,9 @@ function layoutContent(columns, rows) {
     place(element, column, row, width, height);
     return row + height;
   };
-  const contentRows = Math.max(0, rows - 4);
+  const folderVisible = !find('#folder').hidden;
+  const speedVisible = folderVisible && rows >= 5;
+  const contentRows = Math.max(0, rows - 4 - Number(speedVisible));
   const centerRow = Math.max(0, Math.floor((contentRows - 5) / 2));
   const content = find('#content');
   place(content, 0, 2, columns, Math.max(1, contentRows));
@@ -132,14 +134,18 @@ function layoutContent(columns, rows) {
       row += 6;
     }
   }
-  const folderVisible = !find('#folder').hidden;
   const routeColumn = buttonCells('#leave') + 1;
   const routeWidth = Math.max(0, columns - 14 - routeColumn - 1);
   find('#tagline').style.display = folderVisible ? 'none' : '';
   find('.route').style.display = folderVisible && rows >= 3 && routeWidth > 0 ? '' : 'none';
   find('#hotkeys').style.display = rows >= 3 ? '' : 'none';
   find('.folder-head').style.display = folderVisible && rows >= 3 ? 'contents' : 'none';
+  find('#speed-row').style.display = speedVisible ? 'contents' : 'none';
   if (folderVisible) {
+    if (speedVisible) {
+      place(find('#speed-test'), 0, rows - 3, 9);
+      place(find('#speed-results'), 10, rows - 3, Math.max(1, columns - 10));
+    }
     place(find('label[for="add-files"]'), Math.max(0, columns - 3), Math.max(0, rows - 1), 3);
     place(find('#add-folder'), Math.max(0, columns - 14), Math.max(0, rows - 1), 10);
     row = 0;

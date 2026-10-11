@@ -27,6 +27,7 @@
         <div id="transfer" hidden><div class="transfer-top"><span id="transfer-label"></span><button id="cancel-transfer">cancel</button></div><progress id="progress" value="0" max="100"></progress><div class="muted" id="progress-text"></div></div>
       </section>
       </div>
+      <div id="speed-row" hidden><button id="speed-test" aria-disabled="true" title="Measure the direct channel for two seconds per direction, up to 128 MiB total">speedtest</button><span id="speed-results" aria-live="polite">↑--.- ↓--.- MB/s</span></div>
       <div class="folder-head"><button id="add-folder">add folder</button><label class="button" for="add-files" role="button" tabindex="0">add</label><input id="add-files" type="file" multiple hidden><input id="add-directory" type="file" webkitdirectory multiple hidden></div>
       <div class="route">route: <span id="route">detecting</span></div>
       <div id="hotkeys" class="hotkeys" aria-label="Keyboard shortcuts"><div class="hotkeys-track"><span>h ←  j ↓  k ↑  l →  Tab next  Shift+Tab previous  Enter activate  q delete  d download  r replace</span><span aria-hidden="true">h ←  j ↓  k ↑  l →  Tab next  Shift+Tab previous  Enter activate  q delete  d download  r replace</span></div></div>

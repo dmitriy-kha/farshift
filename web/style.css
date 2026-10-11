@@ -61,7 +61,7 @@ button, input, select { font: inherit; letter-spacing: inherit; }
 #content::-webkit-scrollbar { display: none; }
 #status { height: var(--ch); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 #content > section, .topline, .topline-actions, .create-row, .join-row,
-.actions, .folder-head, #transfer, .transfer-top, .session-actions { display: contents; }
+.actions, .folder-head, #transfer, .transfer-top, .session-actions, #speed-row { display: contents; }
 #content > section > *, #content > p,
 .topline > span, .topline-actions > *, .create-row > *, .join-row > *,
 .actions > *, .folder-head > *, .transfer-top > *, #transfer > .muted {
@@ -181,6 +181,7 @@ button:focus, .button:focus, button.directory-toggle:focus {
 .directory-name { overflow: hidden; text-overflow: ellipsis; }
 .empty { grid-column: 1 / -1; color: var(--theme-2); overflow-wrap: anywhere; }
 .route { color: var(--theme-3); height: var(--ch); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#speed-results { color: var(--theme-3); height: var(--ch); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .hotkeys { color: var(--theme-3); height: var(--ch); overflow: hidden; white-space: pre; }
 .hotkeys-track { display: flex; width: max-content; animation: hotkeys-scroll 30s linear infinite; }
 .hotkeys-track > span { flex-shrink: 0; padding-right: calc(2 * var(--cw)); }
