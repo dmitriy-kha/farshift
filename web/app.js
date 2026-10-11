@@ -249,6 +249,7 @@ function securityFailure() {
   closeSession('Code or confirmation incorrect. Folder closed. Get a new code.');
 }
 function connect(secret, ttl, explicit) {
+  if (!window.isSecureContext || !crypto.subtle) throw Error('Secure connection required. Open this page over HTTPS.');
   const now = sessionNow();
   app.attempts = app.attempts.filter(started => now - started < 120000);
   if (app.attempts.length >= 5) throw Error('Pairing attempt limit reached. Wait two minutes.');
@@ -336,11 +337,22 @@ async function handleServer(value, generation) {
     }
     case 'error': {
       const messages = { 'room unavailable': 'Session not found, code expired or already used.',
+        'peer unavailable': 'Other device code not found, expired or already used. Get new codes on both devices.',
+        'peer too slow': 'Other device is not receiving connection details. Check its connection and get new codes.',
         'server full': 'No codes available. Try again in two minutes.',
         'admission rate limit': 'Too many requests. Try again later.', 'rate limit': 'Too many requests. Try again later.' };
       closeSession(messages[value.message] || 'Could not connect. Code may have expired or been used.'); break;
     }
-    case 'closed': closeSession('Session expired or other device disconnected. Folder closed.'); break;
+    case 'closed': {
+      const messages = {
+        pairing_timeout: 'Code exchange timed out. Get new codes on both devices and enter them within two minutes.',
+        expired: 'Folder lifetime expired. Get new codes on both devices.',
+        peer_disconnected: 'Other device disconnected. Keep both tabs open and get new codes.',
+        'connection unavailable': 'Could not deliver pairing messages. Get new codes on both devices.',
+      };
+      closeSession(messages[value.reason] || 'Server closed the session. Get new codes on both devices.');
+      break;
+    }
     case 'paired': break;
     default: throw Error('Invalid server message');
   }

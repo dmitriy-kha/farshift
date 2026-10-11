@@ -8,7 +8,7 @@ on:
       version:
         description: Existing release tag
         required: true
-        default: v0.1.1
+        default: v0.1.2
         type: string
       deploy:
         description: Deploy to production after publishing
@@ -16,7 +16,7 @@ on:
         default: true
         type: boolean
       rebuild:
-        description: Rebuild images and replace the existing release manifest
+        description: Rebuild images instead of reusing an existing release manifest
         required: true
         default: false
         type: boolean
@@ -33,10 +33,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
-      contents: write
+      contents: read
       packages: write
     outputs:
       version: ${{ steps.release.outputs.version }}
+      manifest: ${{ steps.release.outputs.manifest }}
     steps:
       - name: Checkout automation
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -84,6 +85,7 @@ jobs:
       - name: Deploy published images and verify HTTPS
         env:
           VERSION: ${{ needs.publish.outputs.version }}
+          IMAGES_MANIFEST: ${{ needs.publish.outputs.manifest }}
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}

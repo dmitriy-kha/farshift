@@ -237,6 +237,10 @@ struct Peer {
     close: watch::Sender<Option<&'static str>>,
     paired: bool,
 }
+struct RelayDelivery {
+    tx: mpsc::Sender<Output>,
+    payload: String,
+}
 struct Room {
     code: String,
     code_index: usize,
@@ -444,7 +448,7 @@ impl State {
         );
         Ok(id)
     }
-    fn process(&self, id: u64, input: Input) -> Result<(), &'static str> {
+    fn process(&self, id: u64, input: Input) -> Result<Option<RelayDelivery>, &'static str> {
         let mut registry = self.inner.registry.lock().unwrap();
         let now = Instant::now();
         let matched = registry.rooms.get(&id).and_then(|room| room.matched);
@@ -485,7 +489,7 @@ impl State {
                 let mutual = other.selected == Some(id);
                 registry.rooms.get_mut(&id).unwrap().selected = Some(other_id);
                 if !mutual {
-                    return Ok(());
+                    return Ok(None);
                 }
                 let attempt = random_id()?;
                 let rooms = &mut registry.rooms;
@@ -542,7 +546,7 @@ impl State {
                         return Err("connection unavailable");
                     }
                 }
-                Ok(())
+                Ok(None)
             }
             Input::Relay { payload } if payload.len() <= 48 * 1024 => {
                 let other_id = room.matched.ok_or("mutual selection required")?;
@@ -551,11 +555,10 @@ impl State {
                     .get(&other_id)
                     .filter(|r| r.matched == Some(id))
                     .ok_or("peer unavailable")?;
-                other
-                    .peer
-                    .tx
-                    .try_send(Output::Relay { payload })
-                    .map_err(|_| "peer too slow")
+                Ok(Some(RelayDelivery {
+                    tx: other.peer.tx.clone(),
+                    payload,
+                }))
             }
             Input::Paired {} if room.matched.is_some() => {
                 let other_id = room.matched.unwrap();
@@ -570,7 +573,7 @@ impl State {
                     registry.release_code(id);
                     registry.release_code(other_id);
                 }
-                Ok(())
+                Ok(None)
             }
             Input::Invalidate {} => Err("code invalidated"),
             _ => Err("invalid message"),
@@ -681,6 +684,8 @@ async fn session(mut socket: WebSocket, state: State) {
     let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     heartbeat.tick().await;
+    let mut pending_relay: Option<RelayDelivery> = None;
+    let mut relay_deadline = tokio::time::Instant::now();
     loop {
         if *shutdown.borrow() || last_received.elapsed() >= Duration::from_secs(90) {
             break;
@@ -700,7 +705,20 @@ async fn session(mut socket: WebSocket, state: State) {
             outgoing = rx.recv() => {
                 if let Some(output) = outgoing { if !send(&mut socket, output).await { break; } } else { break; }
             }
-            incoming = socket.recv() => {
+            // Drain our own queue while waiting, so simultaneous ICE bursts cannot deadlock.
+            permit = async {
+                let tx = pending_relay.as_ref().unwrap().tx.clone();
+                tokio::time::timeout_at(relay_deadline, tx.reserve_owned()).await
+            }, if pending_relay.is_some() => {
+                match permit {
+                    Ok(Ok(permit)) => {
+                        let relay = pending_relay.take().unwrap();
+                        permit.send(Output::Relay { payload: relay.payload });
+                    }
+                    _ => { send(&mut socket, Output::Error { message: "peer too slow" }).await; break; }
+                }
+            }
+            incoming = socket.recv(), if pending_relay.is_none() => {
                 last_received = Instant::now();
                 if window.elapsed() >= Duration::from_secs(1) { window = Instant::now(); messages = 0; }
                 messages += 1;
@@ -708,7 +726,13 @@ async fn session(mut socket: WebSocket, state: State) {
                 match incoming {
                     Some(Ok(Message::Text(s))) => {
                         let result = serde_json::from_str::<Input>(&s).map_err(|_| "invalid message").and_then(|input| state.process(id, input));
-                        if let Err(message) = result { send(&mut socket, Output::Error { message }).await; break; }
+                        match result {
+                            Ok(relay) => {
+                                pending_relay = relay;
+                                relay_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                            }
+                            Err(message) => { send(&mut socket, Output::Error { message }).await; break; }
+                        }
                     }
                     Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {},
                     _ => break,
