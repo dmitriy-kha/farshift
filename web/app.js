@@ -1,12 +1,14 @@
 import { validRoom, validSecret, normalizeCode, randomSecret, Pairing } from './protocol.js';
-import { prepare, available, Download } from './download.js';
+import { prepare, Download } from './download.js';
 
 const animationSettings = {
   code_min_delay_ms: 100, code_random_range_ms: 220, code_tick_ms: 50,
   indicator_ready_ms: 180, indicator_waiting_ms: 120,
 };
+const animationRequest = new AbortController();
+const animationTimeout = setTimeout(() => animationRequest.abort(), 3000);
 try {
-  const response = await fetch('/ui-config.yaml', { cache: 'no-store' });
+  const response = await fetch('/ui-config.yaml', { cache: 'no-store', signal: animationRequest.signal });
   if (!response.ok) throw Error('Animation settings unavailable');
   const settings = { ...animationSettings };
   // This configuration supports flat YAML numeric settings and comments only.
@@ -23,10 +25,9 @@ try {
   Object.assign(animationSettings, settings);
 } catch (error) {
   console.warn('Using default animation settings:', error);
-}
+} finally { clearTimeout(animationTimeout); }
 
 const CHUNK = 16 * 1024;
-const FALLBACK_LIMIT = 32 * 1024 * 1024;
 const MAX_LOCAL_ENTRIES = 10000;
 const MAX_FILES = MAX_LOCAL_ENTRIES * 2;
 const MAX_DEPTH = 32;
@@ -35,6 +36,8 @@ const MAX_CONTROL_QUEUE = 64 * 1024 * 1024;
 const MAX_SIGNAL = 48 * 1024;
 const MAX_WS = 64 * 1024;
 const TRANSFER_IDLE_TIMEOUT = 30000;
+const TRANSFER_WRITE_TIMEOUT = 60000;
+const SIGNAL_OPEN_TIMEOUT = 15000;
 const CHANNEL_OPEN_TIMEOUT = 45000;
 const DEFAULT_TTL = 60 * 60;
 const MAX_TTL = 999 * 60;
@@ -51,7 +54,8 @@ const app = {
   localExpiresAt: 0, localPairingDeadline: 0, configuration: null,
   serverOffset: 0, serverExpiresAt: 0, serverPairingDeadline: 0,
   lifetime: null, lifetimeConfirmed: false,
-  connectingAt: 0, remoteCandidates: [],
+  signalingAt: 0, connectingAt: 0, remoteCandidates: [],
+  ice: { local: 0, remote: 0, public: 0, stunFailed: false },
   clock: 0, files: new Map(), local: new Map(), created: new Set(), expanded: new Set(), replace: null, outgoing: null,
   incoming: null, folderDownload: null, directoryImport: null,
   preparingDownload: false, receivingDone: false, disconnectedAt: 0,
@@ -138,7 +142,7 @@ const validHex = value => typeof value === 'string' && /^[0-9a-fA-F]{32}$/.test(
 const unsigned = value => Number.isSafeInteger(value) && value >= 0;
 const positive = value => unsigned(value) && value > 0 && value < Number.MAX_SAFE_INTEGER;
 const randomId = () => Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join('');
-const current = generation => app.generation === generation && app.ws !== null;
+const current = generation => app.generation === generation && (app.ws !== null || app.channel !== null);
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const busy = value => { disableButton(element('create'), value); disableButton(element('join'), value || !app.room || Boolean(app.peer)); };
 function wsSend(value) {
@@ -190,11 +194,13 @@ async function flushControl() {
 function tryControl(value) { try { controlSend(value); } catch {} }
 function tryWs(value) { try { wsSend(value); } catch {} }
 async function signalSend(value, generation) {
+  if (app.ws?.readyState !== WebSocket.OPEN && preserveDirectConnection(app.ws)) return;
   if (!app.session) throw Error('Missing key');
   const payload = await app.session.seal(JSON.stringify(value));
   if (!current(generation)) return;
+  if (app.ws?.readyState !== WebSocket.OPEN && preserveDirectConnection(app.ws)) return;
   if (byteLength(payload) > MAX_SIGNAL) throw Error('SDP too large');
-  wsSend({ type: 'relay', payload });
+  wsSend({ type: 'signal', payload });
 }
 function abortReceiver(receiver) {
   receiver?.reject?.(Error('Transfer cancelled or could not be saved'));
@@ -223,7 +229,7 @@ function closeSession(message = '') {
   app.generation++;
   for (const object of [app.ws, app.channel, app.pc]) {
     if (!object) continue;
-    for (const name of ['onmessage', 'onopen', 'onclose', 'onerror', 'ondatachannel', 'onconnectionstatechange', 'onicecandidate']) object[name] = null;
+    for (const name of ['onmessage', 'onopen', 'onclose', 'onerror', 'ondatachannel', 'onconnectionstatechange', 'onicecandidate', 'onicecandidateerror', 'onicegatheringstatechange', 'oniceconnectionstatechange']) object[name] = null;
     try { object.close(); } catch {}
   }
   app.session?.destroy?.(); app.pairing?.destroy?.();
@@ -235,7 +241,8 @@ function closeSession(message = '') {
   app.expiresAt = app.pairingDeadline = app.localExpiresAt = app.localPairingDeadline = 0;
   app.serverOffset = app.serverExpiresAt = app.serverPairingDeadline = 0;
   app.lifetime = null; app.lifetimeConfirmed = false;
-  app.connectingAt = 0; app.remoteCandidates = [];
+  app.signalingAt = app.connectingAt = 0; app.remoteCandidates = [];
+  app.ice = { local: 0, remote: 0, public: 0, stunFailed: false };
   app.preparingDownload = app.receivingDone = false; app.disconnectedAt = 0;
   showCode(''); text('files', ''); text('timer', 'TTL --:--');
   clearJoinCode();
@@ -247,6 +254,15 @@ function closeSession(message = '') {
 function securityFailure() {
   tryWs({ type: 'invalidate' });
   closeSession('Code or confirmation incorrect. Folder closed. Get a new code.');
+}
+function preserveDirectConnection(ws) {
+  if (!app.lifetimeConfirmed || app.channel?.readyState !== 'open') return false;
+  if (!ws) return true;
+  ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null;
+  if (app.ws === ws) app.ws = null;
+  try { ws.close(); } catch {}
+  notice('The pairing server connection closed. Direct file transfer remains active.');
+  return true;
 }
 function connect(secret, ttl, explicit) {
   if (!window.isSecureContext || !crypto.subtle) throw Error('Secure connection required. Open this page over HTTPS.');
@@ -263,12 +279,13 @@ function connect(secret, ttl, explicit) {
   ws.binaryType = 'arraybuffer';
   const generation = app.generation;
   app.ws = ws; app.secret = secret;
+  app.signalingAt = now;
   app.lifetime = { ttl, explicit, expires_at: now + ttl * 1000 };
   // An untouched default permits the peer's choice, even if its code is issued later.
   app.localExpiresAt = now + (explicit ? ttl : MAX_TTL + 120) * 1000;
   app.localPairingDeadline = now + Math.min(120000, ttl * 1000);
   text('timer', `TTL ${timeLeft((app.localPairingDeadline - sessionNow()) / 1000)}`);
-  busy(true); status('Connecting');
+  busy(true); status('Connecting to server'); notice('Requesting a code from the pairing server.');
   hidden('entry', false); hidden('waiting', false); hidden('code', false); disableButton(element('copy'), true);
   ws.onopen = () => { if (current(generation)) { try { wsSend({ type: 'create', ttl, ttl_explicit: explicit }); } catch { closeSession('Could not open session'); } } };
   // Crypto and SDP operations must preserve the server's ordered message stream.
@@ -277,7 +294,7 @@ function connect(secret, ttl, explicit) {
     if (!current(generation)) return;
     if (typeof event.data !== 'string' || byteLength(event.data) > MAX_WS) { securityFailure(); return; }
     queue = queue.then(async () => {
-      if (current(generation)) await handleServer(JSON.parse(event.data), generation);
+      if (current(generation) && app.ws === ws) await handleServer(JSON.parse(event.data), generation);
     }).catch(error => {
       if (!current(generation)) return;
       console.error('Session message rejected:', error);
@@ -285,8 +302,12 @@ function connect(secret, ttl, explicit) {
       else securityFailure();
     });
   };
-  ws.onclose = () => { if (current(generation)) closeSession('Session closed. Get a new code.'); };
-  ws.onerror = () => { if (current(generation)) closeSession('Server unavailable. Check your connection.'); };
+  ws.onclose = () => {
+    if (current(generation) && !preserveDirectConnection(ws)) closeSession('Pairing server connection closed. Get new codes on both devices.');
+  };
+  ws.onerror = () => {
+    if (current(generation) && !preserveDirectConnection(ws)) closeSession('Pairing server unavailable. Check your connection.');
+  };
 }
 async function handleServer(value, generation) {
   switch (value?.type) {
@@ -298,14 +319,21 @@ async function handleServer(value, generation) {
       app.serverOffset = value.expires_at - app.lifetime.expires_at;
       app.serverExpiresAt = value.expires_at; app.serverPairingDeadline = value.pairing_deadline;
       app.room = value.room;
+      app.signalingAt = 0;
       app.expiresAt = value.expires_at - app.serverOffset;
       app.pairingDeadline = value.pairing_deadline - app.serverOffset;
       app.lifetime.expires_at = value.expires_at;
-      app.configuration = { iceServers: value.ice_servers || [], iceTransportPolicy: value.relay_only === true ? 'relay' : 'all' };
+      // STUN discovers addresses for the direct connection.
+      const iceServers = (value.ice_servers || []).flatMap(server => {
+        const urls = (Array.isArray(server.urls) ? server.urls : [server.urls])
+          .filter(url => typeof url === 'string' && /^stuns?:/.test(url));
+        return urls.length ? [{ urls }] : [];
+      });
+      app.configuration = { iceServers, iceTransportPolicy: 'all' };
       const code = app.room + app.secret;
       showCode(code); hidden('code', false);
       disableButton(element('copy'), false); disableButton(element('join'), false);
-      status('Exchange codes'); tick(); break;
+      status('Exchange codes'); notice('Enter the other device\'s code here and this code on the other device.'); tick(); break;
     }
     case 'peer_ready': {
       const role = app.room < app.peer ? 'a' : 'b';
@@ -322,11 +350,11 @@ async function handleServer(value, generation) {
       app.role = role; app.pairing = result.pairing; app.pakeMessage = result.message;
       app.expiresAt = value.expires_at - app.serverOffset;
       app.pairingDeadline = value.pairing_deadline - app.serverOffset;
-      status('Verifying codes');
-      wsSend({ type: 'relay', payload: JSON.stringify({ type: 'pake', bytes: Array.from(result.message) }) }); break;
+      status('Verifying codes'); notice('Both devices selected each other. Verifying the codes.');
+      wsSend({ type: 'signal', payload: JSON.stringify({ type: 'pake', bytes: Array.from(result.message) }) }); break;
     }
-    case 'relay': {
-      if (typeof value.payload !== 'string' || byteLength(value.payload) > MAX_SIGNAL) throw Error('Invalid relay');
+    case 'signal': {
+      if (typeof value.payload !== 'string' || byteLength(value.payload) > MAX_SIGNAL) throw Error('Invalid signaling message');
       if (!app.paired) await handlePairing(value.payload, generation);
       else {
         if (!app.session) throw Error('Missing key');
@@ -344,7 +372,9 @@ async function handleServer(value, generation) {
       closeSession(messages[value.message] || 'Could not connect. Code may have expired or been used.'); break;
     }
     case 'closed': {
+      if (value.reason === 'peer_disconnected' && preserveDirectConnection(app.ws)) break;
       const messages = {
+        code_invalidated: 'The other device rejected or expired the codes. Get new codes on both devices.',
         pairing_timeout: 'Code exchange timed out. Get new codes on both devices and enter them within two minutes.',
         expired: 'Folder lifetime expired. Get new codes on both devices.',
         peer_disconnected: 'Other device disconnected. Keep both tabs open and get new codes.',
@@ -372,20 +402,51 @@ async function handlePairing(payload, generation) {
     if (!current(generation)) { session.destroy?.(); return; }
     app.session = session;
     const proof = await session.confirmation();
-    if (current(generation)) wsSend({ type: 'relay', payload: JSON.stringify({ type: 'proof', bytes: Array.from(proof) }) });
+    if (current(generation)) wsSend({ type: 'signal', payload: JSON.stringify({ type: 'proof', bytes: Array.from(proof) }) });
   } else if (value.type === 'proof') {
     if (bytes.length !== 32 || !app.session) throw Error('Invalid code');
     await app.session.verifyConfirmation(bytes);
     if (!current(generation)) return;
     app.paired = true; app.secret = app.peerSecret = ''; app.pakeMessage?.fill(0);
+    app.connectingAt = sessionNow();
+    status('Codes verified'); notice('Codes verified. Waiting for the other device\'s connection settings.');
     showCode(''); hidden('waiting', true); hidden('entry', true);
     await signalSend({ type: 'lifetime', ...app.lifetime }, generation);
   } else throw Error('Invalid pairing message');
 }
 class WebRTCError extends Error {}
-async function rtc(operation) {
+async function rtc(operation, action) {
   try { return await operation(); }
-  catch { throw new WebRTCError('WebRTC setup failed. Check network or TURN.'); }
+  catch { throw new WebRTCError(`${action} failed in this browser. Refresh both devices and try again.`); }
+}
+function directConnectionFailure() {
+  const pc = app.pc;
+  if (pc && !app.connectingAt) return 'Direct connection lost. Check the network and get new codes.';
+  if (!pc?.remoteDescription) return 'The other device did not finish exchanging connection settings. Keep both tabs open and get new codes.';
+  if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+    return 'A direct route was found, but the secure file channel did not open. Refresh both devices and try again.';
+  }
+  if (!app.ice.local) return 'This browser provided no direct network addresses. Check its WebRTC settings.';
+  if (!app.ice.remote) return 'The other device provided no direct network addresses. Check its WebRTC settings.';
+  if (app.ice.stunFailed && !app.ice.public) {
+    return 'STUN did not discover a public address and no direct route was found. Try the same Wi-Fi or another network.';
+  }
+  return 'No direct route was found. NAT, firewall or VPN may block it. Try the same Wi-Fi or another network.';
+}
+function connectionProgress() {
+  const pc = app.pc;
+  if (!pc || app.channel?.readyState === 'open') return;
+  if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+    status('Opening file channel'); notice('Direct route found. Opening the secure file channel.');
+  } else if (pc.iceConnectionState === 'checking') {
+    status('Checking direct routes'); notice('Codes verified. Checking direct routes between the devices.');
+  } else if (!pc.remoteDescription) {
+    status('Exchanging connection details'); notice('Codes verified. Waiting for the other device\'s connection details.');
+  } else if (pc.iceGatheringState === 'gathering') {
+    status('Finding direct addresses'); notice('Finding direct network addresses with STUN. File data is not sent to STUN.');
+  } else {
+    status('Waiting direct connection'); notice('Waiting for a working direct route.');
+  }
 }
 function setupPeer() {
   if (app.pc || !app.configuration) throw Error('Invalid connection');
@@ -396,8 +457,20 @@ function setupPeer() {
   app.pc = pc;
   pc.onicecandidate = event => {
     if (!current(generation)) return;
+    if (event.candidate) {
+      app.ice.local++;
+      if (event.candidate.type === 'srflx' || /\btyp srflx\b/.test(event.candidate.candidate)) app.ice.public++;
+    }
+    if (!app.ws && app.channel?.readyState === 'open') return;
     signalSend({ type: 'candidate', candidate: event.candidate?.toJSON() ?? null }, generation)
       .catch(() => { if (current(generation)) closeSession('Could not send WebRTC connection details.'); });
+  };
+  pc.onicecandidateerror = () => { if (current(generation)) app.ice.stunFailed = true; };
+  pc.onicegatheringstatechange = () => { if (current(generation)) connectionProgress(); };
+  pc.oniceconnectionstatechange = () => {
+    if (!current(generation)) return;
+    if (pc.iceConnectionState === 'failed') closeSession(directConnectionFailure());
+    else connectionProgress();
   };
   pc.ondatachannel = event => {
     if (!current(generation)) return;
@@ -406,11 +479,17 @@ function setupPeer() {
   pc.onconnectionstatechange = () => {
     if (!current(generation)) return;
     switch (pc.connectionState) {
-      case 'failed': case 'closed': closeSession('Connection lost. Get a new code.'); break;
+      case 'failed': closeSession(directConnectionFailure()); break;
+      case 'closed': closeSession('Direct connection closed. Get new codes on both devices.'); break;
       case 'disconnected':
-        app.disconnectedAt = sessionNow(); status('Connection interrupted'); text('route', 'reconnecting'); renderFiles(); break;
+        if (!app.disconnectedAt) app.disconnectedAt = sessionNow();
+        status('Connection interrupted'); text('route', 'direct connection interrupted');
+        notice('Direct connection interrupted. Waiting up to 30 seconds for the route to recover.'); renderFiles(); break;
       case 'connected':
-        app.disconnectedAt = 0; status('Both devices online', 'connected'); renderFiles(); updateRoute(pc, generation).catch(() => {}); break;
+        app.disconnectedAt = 0;
+        if (app.channel?.readyState === 'open') { status('Both devices online', 'connected'); notice(''); }
+        else connectionProgress();
+        renderFiles(); break;
     }
   };
   return pc;
@@ -432,18 +511,18 @@ async function applyCandidates(pc, generation) {
   // Candidates can arrive before the authenticated offer or answer.
   while (app.remoteCandidates.length && current(generation)) {
     const candidate = app.remoteCandidates.shift();
-    await rtc(() => pc.addIceCandidate(candidate));
+    await rtc(() => pc.addIceCandidate(candidate), 'Applying a direct network address');
   }
 }
 async function createOffer(generation) {
   if (!current(generation)) return;
   const pc = setupPeer();
-  const channel = await rtc(() => pc.createDataChannel('folder', { ordered: true }));
+  const channel = await rtc(() => pc.createDataChannel('folder', { ordered: true }), 'Creating the file channel');
   if (!current(generation)) return;
   attachChannel(channel);
-  const offer = await rtc(() => pc.createOffer());
+  const offer = await rtc(() => pc.createOffer(), 'Preparing connection details');
   if (!current(generation)) return;
-  await rtc(() => pc.setLocalDescription(offer));
+  await rtc(() => pc.setLocalDescription(offer), 'Applying local connection details');
   if (current(generation)) await signalSend({ type: 'offer', sdp: localSdp(pc) }, generation);
 }
 async function handleSignal(value, generation) {
@@ -460,46 +539,39 @@ async function handleSignal(value, generation) {
     app.expiresAt = app.localExpiresAt = Math.min(app.expiresAt, app.localExpiresAt, expiry - app.serverOffset);
     if (app.expiresAt <= sessionNow()) throw Error('Folder expired. Temporary state cleared.');
     app.lifetimeConfirmed = true;
-    app.connectingAt = sessionNow();
-    status('Opening auth channel'); tick(); wsSend({ type: 'paired' });
+    status('Exchanging connection details'); notice('Codes verified. Preparing a direct connection.');
+    tick(); wsSend({ type: 'paired' });
     if (app.role === 'a') await createOffer(generation);
     return;
   }
   if (!app.lifetimeConfirmed) throw Error('Lifetime not confirmed');
   if (value?.type === 'candidate') {
     if (!validCandidate(value.candidate) || app.remoteCandidates.length >= 256) throw Error('Invalid ICE candidate');
+    if (value.candidate) {
+      if (value.candidate.candidate && !/\btyp (host|srflx|prflx)\b/.test(value.candidate.candidate)) throw new WebRTCError('The other device supplied an unsupported network address. Refresh both devices.');
+      if (value.candidate.candidate) app.ice.remote++;
+    }
     app.remoteCandidates.push(value.candidate);
     if (app.pc?.remoteDescription) await applyCandidates(app.pc, generation);
     return;
   }
   const sdp = value?.sdp;
   if (typeof sdp !== 'string' || byteLength(sdp) > 128 * 1024 || !sdp.includes('a=fingerprint:')) throw Error('Missing DTLS fingerprint');
+  if ((sdp.match(/^a=candidate:.*$/gm) || []).some(candidate => !/\btyp (host|srflx|prflx)\b/.test(candidate))) throw new WebRTCError('The other device supplied an unsupported network address. Refresh both devices.');
+  app.ice.remote += (sdp.match(/^a=candidate:/gm) || []).length;
   if (value.type === 'offer' && app.role === 'b') {
-    const pc = setupPeer(); await rtc(() => pc.setRemoteDescription({ type: 'offer', sdp }));
+    const pc = setupPeer(); await rtc(() => pc.setRemoteDescription({ type: 'offer', sdp }), 'Applying the other device\'s connection details');
     if (!current(generation)) return;
     await applyCandidates(pc, generation);
-    const answer = await rtc(() => pc.createAnswer());
+    const answer = await rtc(() => pc.createAnswer(), 'Preparing the connection response');
     if (!current(generation)) return;
-    await rtc(() => pc.setLocalDescription(answer));
+    await rtc(() => pc.setLocalDescription(answer), 'Applying the connection response');
     if (current(generation)) await signalSend({ type: 'answer', sdp: localSdp(pc) }, generation);
   } else if (value.type === 'answer' && app.role === 'a') {
     if (!app.pc || app.pc.remoteDescription) throw Error('Invalid answer');
-    await rtc(() => app.pc.setRemoteDescription({ type: 'answer', sdp }));
+    await rtc(() => app.pc.setRemoteDescription({ type: 'answer', sdp }), 'Applying the other device\'s connection response');
     if (current(generation)) await applyCandidates(app.pc, generation);
   } else throw Error('Invalid SDP');
-}
-async function updateRoute(pc, generation) {
-  const stats = await pc.getStats();
-  if (!current(generation)) return;
-  let selected;
-  for (const value of stats.values()) if (value.type === 'transport') selected = value.selectedCandidatePairId;
-  for (const value of stats.values()) {
-    if (value.type !== 'candidate-pair' || value.state !== 'succeeded'
-      || !(value.nominated || value.selected || selected === value.id)) continue;
-    const relay = [stats.get(value.localCandidateId), stats.get(value.remoteCandidateId)].some(v => v?.candidateType === 'relay');
-    text('route', relay ? 'via TURN' : 'direct connection'); return;
-  }
-  text('route', 'authenticated connection');
 }
 function attachChannel(channel) {
   if (app.channel || channel.label !== 'folder' || !channel.ordered || channel.maxRetransmits !== null || channel.maxPacketLifeTime !== null) throw Error('Invalid channel');
@@ -517,13 +589,14 @@ function attachChannel(channel) {
       } else throw Error('Invalid file chunk');
     } catch (error) { closeSession(errorText(error)); }
   };
-  channel.onclose = () => { if (current(generation)) closeSession('Other device disconnected. Folder closed.'); };
-  channel.onerror = () => { if (current(generation)) closeSession('Channel error. Folder closed.'); };
+  channel.onclose = () => { if (current(generation)) closeSession('The other device closed the direct file channel. Get new codes on both devices.'); };
+  channel.onerror = () => { if (current(generation)) closeSession('The direct file channel failed. Get new codes on both devices.'); };
   if (channel.readyState === 'open') channelReady();
 }
 function channelReady() {
   if (!app.paired || !app.lifetimeConfirmed || sessionNow() >= Math.min(app.expiresAt, app.localExpiresAt) || !app.pc?.remoteDescription) { securityFailure(); return; }
   app.connectingAt = 0;
+  text('route', 'direct connection');
   status('Both devices online', 'connected'); tick(); hidden('folder', false); notice('');
   renderFiles(); sendInventory();
 }
@@ -579,7 +652,7 @@ function parseControl(payload) {
   const value = JSON.parse(payload);
   const fields = { inventory: ['files'], put: ['file'], get: ['transfer', 'id', 'version'],
     start: ['transfer', 'id', 'version', 'size'], ack: ['transfer'], done: ['transfer'],
-    cancel: ['transfer'], error: ['transfer', 'message'] };
+    received: ['transfer'], cancel: ['transfer'], error: ['transfer', 'message'] };
   const required = fields[value?.type];
   if (!required || Object.keys(value).length !== required.length + 1 || !required.every(key => Object.hasOwn(value, key))) throw Error('Invalid folder message');
   if (required.includes('transfer') && typeof value.transfer !== 'string') throw Error('Invalid transfer');
@@ -640,7 +713,7 @@ function handleControl(value, generation) {
       break;
     }
     case 'ack':
-      if (app.outgoing?.transfer !== value.transfer || app.outgoing.busy) return;
+      if (app.outgoing?.transfer !== value.transfer || app.outgoing.busy || app.outgoing.finishing) return;
       app.outgoing.activity = sessionNow();
       sendChunk(value.transfer, generation).catch(error => {
         if (current(generation) && app.outgoing?.transfer === value.transfer) {
@@ -649,6 +722,13 @@ function handleControl(value, generation) {
       }); break;
     case 'done':
       finishDownload(value.transfer, generation).catch(error => { if (current(generation)) closeSession(errorText(error)); }); break;
+    case 'received': {
+      const sender = app.outgoing;
+      if (!sender || sender.transfer !== value.transfer) return;
+      if (!sender.finishing || sender.offset !== sender.size) throw Error('Invalid completion acknowledgement');
+      app.outgoing = null;
+      hidden('transfer', !app.incoming && !app.folderDownload); notice('Transfer completed on the other device'); break;
+    }
     case 'cancel': cancelOne(value.transfer, 'Transfer cancelled'); break;
     case 'error':
       if (byteLength(value.message) > 1024) throw Error('Invalid transfer message');
@@ -673,11 +753,12 @@ async function sendChunk(transfer, generation) {
   if (!current(generation)) return;
   const sender = app.outgoing;
   if (!sender || sender.transfer !== transfer || sender.busy) return;
-  sender.busy = true;
+  sender.busy = true; sender.activity = sessionNow();
   const { file, offset, size } = sender;
   if (offset === size) {
-    controlSend({ type: 'done', transfer }); app.outgoing = null;
-    hidden('transfer', !app.incoming && !app.folderDownload); notice('File sent'); return;
+    sender.finishing = true; sender.busy = false; sender.activity = sessionNow();
+    controlSend({ type: 'done', transfer });
+    notice('File delivered. Waiting for the other device to finish saving.'); return;
   }
   const end = Math.min(offset + CHUNK, size);
   const bytes = await file.slice(offset, end).arrayBuffer();
@@ -711,7 +792,7 @@ async function receiveChunk(buffer, generation) {
   if (!receiver || receiver.transfer !== transfer) return;
   if (!receiver.startedAck || receiver.busy || offset !== BigInt(receiver.offset)
     || length === 0 || length !== Math.min(receiver.size - receiver.offset, CHUNK)) throw Error('Invalid file chunk');
-  receiver.busy = true;
+  receiver.busy = true; receiver.activity = sessionNow();
   const bytes = packet.subarray(40);
   if (receiver.download || receiver.writer) {
     try {
@@ -725,12 +806,7 @@ async function receiveChunk(buffer, generation) {
       return;
     }
     if (!current(generation) || app.incoming !== receiver) return;
-  } else {
-    if (receiver.offset + length > FALLBACK_LIMIT) {
-      tryControl({ type: 'cancel', transfer }); cancelOne(transfer, 'Memory limit: 32 MiB'); return;
-    }
-    receiver.chunks.push(bytes);
-  }
+  } else throw Error('Download destination is unavailable');
   receiver.offset += length; receiver.busy = false; receiver.activity = sessionNow(); transferProgress(true);
   try { controlSend({ type: 'ack', transfer }); } catch { clearTransfer('Connection lost'); }
 }
@@ -739,13 +815,13 @@ async function finishDownload(transfer, generation) {
   const receiver = app.incoming;
   if (!receiver || receiver.transfer !== transfer) return;
   if (!receiver.startedAck || receiver.offset !== receiver.size || receiver.busy) throw Error('Invalid transfer completion');
-  app.receivingDone = true; receiver.busy = true;
+  app.receivingDone = true; receiver.busy = true; receiver.activity = sessionNow();
   let message, failure;
   try {
     if (receiver.folder) checkFolderDownload(receiver.folder, receiver.entry);
     if (receiver.download) await receiver.download.finish();
     else if (receiver.writer) await receiver.writer.close();
-    else downloadBlob(new Blob(receiver.chunks), receiver.name);
+    else throw Error('Download destination is unavailable');
     message = receiver.writer ? 'File saved' : 'Sent to download manager';
   } catch (error) {
     failure = error;
@@ -754,8 +830,18 @@ async function finishDownload(transfer, generation) {
   if (!current(generation) || app.incoming !== receiver) return;
   app.receivingDone = false; app.incoming = null;
   hidden('transfer', !app.outgoing && !app.folderDownload);
-  if (failure) receiver.reject?.(failure);
-  else receiver.resolve?.();
+  if (failure) {
+    tryControl({ type: 'error', transfer, message: 'Could not save file' });
+    receiver.reject?.(failure);
+  } else {
+    try {
+      controlSend({ type: 'received', transfer });
+      receiver.resolve?.();
+    } catch (error) {
+      receiver.reject?.(error);
+      throw error;
+    }
+  }
   if (!receiver.resolve) notice(message);
 }
 function downloadBlob(blob, name) {
@@ -776,19 +862,14 @@ function downloadFile(id) {
   (async () => {
     let downloader;
     try {
-      let streaming = available();
-      if (!streaming) {
-        try { await prepare(); } catch { /* Small files can use a Blob download. */ }
-        streaming = available();
-      }
+      await prepare();
       if (!current(generation)) return;
-      if (!streaming && file.size > FALLBACK_LIMIT) throw Error('Files larger than 32 MiB need streaming browser downloads.');
-      if (streaming) downloader = await Download.create(file.name, file.size);
+      downloader = await Download.create(file.name, file.size);
       const latest = app.files.get(id);
       if (!current(generation) || !latest || entryUnavailable(latest) || latest.version !== file.version || latest.owner !== file.owner) throw Error('File version changed. Retry the request.');
       const transfer = randomId();
       app.incoming = { transfer, name: file.name, id, version: file.version, size: file.size,
-        offset: 0, download: downloader, chunks: [], busy: false, startedAck: false,
+        offset: 0, download: downloader, busy: false, startedAck: false,
         started: sessionNow(), activity: sessionNow() };
       try { controlSend({ type: 'get', transfer, id, version: file.version }); }
       catch (error) { cancelOne(transfer, 'Source unavailable'); throw error; }
@@ -826,7 +907,7 @@ function receiveFolderFile(entry, writer, job) {
   return new Promise((resolve, reject) => {
     const transfer = randomId();
     app.incoming = { transfer, name: entry.name, id: entry.id, version: entry.version, size: entry.size,
-      offset: 0, writer, chunks: [], busy: false, startedAck: false, started: sessionNow(),
+      offset: 0, writer, busy: false, startedAck: false, started: sessionNow(),
       activity: sessionNow(), folder: job, entry, resolve, reject };
     try { controlSend({ type: 'get', transfer, id: entry.id, version: entry.version }); }
     catch (error) { cancelOne(transfer, errorText(error)); }
@@ -1126,16 +1207,22 @@ function importDirectory(files, context) {
   if (entries.length) commitFolder(entries, generation, replacement);
 }
 function tick() {
-  if (app.connectingAt && sessionNow() - app.connectingAt > CHANNEL_OPEN_TIMEOUT) {
-    closeSession('WebRTC connection timed out. Check network or TURN.'); return;
+  if (app.signalingAt && sessionNow() - app.signalingAt > SIGNAL_OPEN_TIMEOUT) {
+    closeSession('The pairing server did not issue a code within 15 seconds. Check your connection and try again.'); return;
   }
-  if (app.disconnectedAt && sessionNow() - app.disconnectedAt > 30000) { closeSession('Connection not restored. Folder closed.'); return; }
+  if (app.connectingAt && sessionNow() - app.connectingAt > CHANNEL_OPEN_TIMEOUT) {
+    closeSession(directConnectionFailure()); return;
+  }
+  if (app.disconnectedAt && sessionNow() - app.disconnectedAt > 30000) {
+    closeSession('Direct connection did not recover. Check the network and get new codes.'); return;
+  }
   if (app.incoming?.download?.cancelled) {
     const transfer = app.incoming.transfer; tryControl({ type: 'cancel', transfer }); cancelOne(transfer, 'Download cancelled in browser');
   }
   for (const direction of ['incoming', 'outgoing']) {
     const transfer = app[direction];
-    if (transfer && !transfer.busy && sessionNow() - transfer.activity > TRANSFER_IDLE_TIMEOUT) {
+    const timeout = transfer?.busy || transfer?.finishing ? TRANSFER_WRITE_TIMEOUT : TRANSFER_IDLE_TIMEOUT;
+    if (transfer && sessionNow() - transfer.activity > timeout) {
       tryControl({ type: 'cancel', transfer: transfer.transfer });
       cancelOne(transfer.transfer, direction === 'incoming' ? 'File source is not responding' : 'File destination is not responding');
     }
@@ -1195,6 +1282,7 @@ listen('join', 'click', () => {
   if (sessionNow() >= Math.min(app.pairingDeadline, app.localPairingDeadline)) throw Error('Your code has expired. Get a new code.');
   app.peer = peer; app.peerSecret = secret; clearJoinCode(); disableButton(element('join'), true);
   wsSend({ type: 'select', peer }); status('Waiting other device');
+  notice('Code submitted. Enter this device\'s code on the other device to continue.');
 });
 const cleanPeerCode = value => value.toUpperCase().replace(/[^0-9A-HJKMNP-TV-Z]/g, '');
 function setPeerCode(value, cursor = value.length) {

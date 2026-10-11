@@ -8,12 +8,9 @@ use axum::{
     routing::get,
     Router,
 };
-use base64::{engine::general_purpose::STANDARD, Engine};
 mod pairing_code;
 use pairing_code::{room_from_index, valid_room, ROOM_CAPACITY};
-use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha1::Sha1;
 use std::{
     collections::HashMap,
     env,
@@ -39,9 +36,6 @@ pub struct Config {
     pub origin: String,
     pub web_dir: String,
     pub stun_urls: Vec<String>,
-    pub turn_urls: Vec<String>,
-    pub turn_secret: Option<String>,
-    pub relay_only: bool,
     pub max_rooms: usize,
     pub max_connections: usize,
 }
@@ -53,9 +47,6 @@ impl Default for Config {
             origin: "http://127.0.0.1:8080".into(),
             web_dir: "web".into(),
             stun_urls: vec!["stun:stun.cloudflare.com:3478".into()],
-            turn_urls: vec![],
-            turn_secret: None,
-            relay_only: false,
             max_rooms: MAX_PARTICIPANTS,
             max_connections: MAX_PARTICIPANTS,
         }
@@ -76,19 +67,6 @@ impl Config {
         }
         if let Ok(v) = env::var("FARSHIFT_STUN_URLS") {
             c.stun_urls = urls(&v);
-        }
-        if let Ok(v) = env::var("FARSHIFT_TURN_URLS") {
-            c.turn_urls = urls(&v);
-        }
-        c.turn_secret = env::var("FARSHIFT_TURN_SECRET")
-            .ok()
-            .filter(|s| !s.is_empty());
-        if let Ok(value) = env::var("FARSHIFT_RELAY_ONLY") {
-            c.relay_only = match value.as_str() {
-                "0" | "false" => false,
-                "1" | "true" => true,
-                _ => return Err("FARSHIFT_RELAY_ONLY must be 0, false, 1, or true".into()),
-            };
         }
         for (name, dest) in [
             ("FARSHIFT_MAX_ROOMS", &mut c.max_rooms),
@@ -123,43 +101,17 @@ impl Config {
         if c.stun_urls
             .iter()
             .any(|u| !u.starts_with("stun:") && !u.starts_with("stuns:"))
-            || c.turn_urls
-                .iter()
-                .any(|u| !u.starts_with("turn:") && !u.starts_with("turns:"))
         {
-            return Err("invalid STUN/TURN URL scheme".into());
-        }
-        if (!c.turn_urls.is_empty() && c.turn_secret.is_none())
-            || (c.relay_only && c.turn_urls.is_empty())
-        {
-            return Err(
-                "TURN needs FARSHIFT_TURN_URLS and FARSHIFT_TURN_SECRET; relay-only needs TURN"
-                    .into(),
-            );
+            return Err("invalid STUN URL scheme".into());
         }
         Ok(c)
     }
-    fn ice_servers(&self, expires_at: u64, connection: &str) -> Vec<IceServer> {
+    fn ice_servers(&self) -> Vec<IceServer> {
         let mut result = Vec::new();
         if !self.stun_urls.is_empty() {
             result.push(IceServer {
                 urls: self.stun_urls.clone(),
-                username: None,
-                credential: None,
             });
-        }
-        if let Some(secret) = &self.turn_secret {
-            if !self.turn_urls.is_empty() {
-                let username = format!("{}:{}", expires_at.div_ceil(1000), connection);
-                let mut hmac = Hmac::<Sha1>::new_from_slice(secret.as_bytes())
-                    .expect("HMAC accepts any key length");
-                hmac.update(username.as_bytes());
-                result.push(IceServer {
-                    urls: self.turn_urls.clone(),
-                    username: Some(username),
-                    credential: Some(STANDARD.encode(hmac.finalize().into_bytes())),
-                });
-            }
         }
         result
     }
@@ -192,7 +144,7 @@ fn allowed_origin(h: &HeaderMap, origin: &str) -> bool {
 enum Input {
     Create { ttl: u64, ttl_explicit: bool },
     Select { peer: String },
-    Relay { payload: String },
+    Signal { payload: String },
     Paired {},
     Invalidate {},
 }
@@ -205,7 +157,6 @@ enum Output {
         expires_at: u64,
         pairing_deadline: u64,
         ice_servers: Vec<IceServer>,
-        relay_only: bool,
     },
     PeerReady {
         peer: String,
@@ -214,7 +165,7 @@ enum Output {
         expires_at: u64,
         pairing_deadline: u64,
     },
-    Relay {
+    Signal {
         payload: String,
     },
     Error {
@@ -227,17 +178,13 @@ enum Output {
 #[derive(Clone, Debug, Serialize)]
 struct IceServer {
     urls: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    username: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    credential: Option<String>,
 }
 struct Peer {
     tx: mpsc::Sender<Output>,
     close: watch::Sender<Option<&'static str>>,
     paired: bool,
 }
-struct RelayDelivery {
+struct SignalDelivery {
     tx: mpsc::Sender<Output>,
     payload: String,
 }
@@ -414,16 +361,7 @@ impl State {
                 room: code.clone(),
                 expires_at,
                 pairing_deadline,
-                // TURN accounts remain distinct when a public code is recycled.
-                ice_servers: self.inner.config.ice_servers(
-                    if ttl_explicit {
-                        expires_at
-                    } else {
-                        now + (MAX_TTL + PAIRING_SECONDS) * 1000
-                    },
-                    &random_id()?,
-                ),
-                relay_only: self.inner.config.relay_only,
+                ice_servers: self.inner.config.ice_servers(),
             })
             .map_err(|_| "connection unavailable")?;
         registry.reservations[number] = Some(allocated_at + Duration::from_secs(PAIRING_SECONDS));
@@ -448,7 +386,7 @@ impl State {
         );
         Ok(id)
     }
-    fn process(&self, id: u64, input: Input) -> Result<Option<RelayDelivery>, &'static str> {
+    fn process(&self, id: u64, input: Input) -> Result<Option<SignalDelivery>, &'static str> {
         let mut registry = self.inner.registry.lock().unwrap();
         let now = Instant::now();
         let matched = registry.rooms.get(&id).and_then(|room| room.matched);
@@ -548,14 +486,14 @@ impl State {
                 }
                 Ok(None)
             }
-            Input::Relay { payload } if payload.len() <= 48 * 1024 => {
+            Input::Signal { payload } if payload.len() <= 48 * 1024 => {
                 let other_id = room.matched.ok_or("mutual selection required")?;
                 let other = registry
                     .rooms
                     .get(&other_id)
                     .filter(|r| r.matched == Some(id))
                     .ok_or("peer unavailable")?;
-                Ok(Some(RelayDelivery {
+                Ok(Some(SignalDelivery {
                     tx: other.peer.tx.clone(),
                     payload,
                 }))
@@ -575,7 +513,10 @@ impl State {
                 }
                 Ok(None)
             }
-            Input::Invalidate {} => Err("code invalidated"),
+            Input::Invalidate {} => {
+                registry.remove(id, "code_invalidated");
+                Ok(None)
+            }
             _ => Err("invalid message"),
         }
     }
@@ -684,8 +625,8 @@ async fn session(mut socket: WebSocket, state: State) {
     let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     heartbeat.tick().await;
-    let mut pending_relay: Option<RelayDelivery> = None;
-    let mut relay_deadline = tokio::time::Instant::now();
+    let mut pending_signal: Option<SignalDelivery> = None;
+    let mut signal_deadline = tokio::time::Instant::now();
     loop {
         if *shutdown.borrow() || last_received.elapsed() >= Duration::from_secs(90) {
             break;
@@ -707,18 +648,18 @@ async fn session(mut socket: WebSocket, state: State) {
             }
             // Drain our own queue while waiting, so simultaneous ICE bursts cannot deadlock.
             permit = async {
-                let tx = pending_relay.as_ref().unwrap().tx.clone();
-                tokio::time::timeout_at(relay_deadline, tx.reserve_owned()).await
-            }, if pending_relay.is_some() => {
+                let tx = pending_signal.as_ref().unwrap().tx.clone();
+                tokio::time::timeout_at(signal_deadline, tx.reserve_owned()).await
+            }, if pending_signal.is_some() => {
                 match permit {
                     Ok(Ok(permit)) => {
-                        let relay = pending_relay.take().unwrap();
-                        permit.send(Output::Relay { payload: relay.payload });
+                        let signal = pending_signal.take().unwrap();
+                        permit.send(Output::Signal { payload: signal.payload });
                     }
                     _ => { send(&mut socket, Output::Error { message: "peer too slow" }).await; break; }
                 }
             }
-            incoming = socket.recv(), if pending_relay.is_none() => {
+            incoming = socket.recv(), if pending_signal.is_none() => {
                 last_received = Instant::now();
                 if window.elapsed() >= Duration::from_secs(1) { window = Instant::now(); messages = 0; }
                 messages += 1;
@@ -727,9 +668,9 @@ async fn session(mut socket: WebSocket, state: State) {
                     Some(Ok(Message::Text(s))) => {
                         let result = serde_json::from_str::<Input>(&s).map_err(|_| "invalid message").and_then(|input| state.process(id, input));
                         match result {
-                            Ok(relay) => {
-                                pending_relay = relay;
-                                relay_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                            Ok(signal) => {
+                                pending_signal = signal;
+                                signal_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
                             }
                             Err(message) => { send(&mut socket, Output::Error { message }).await; break; }
                         }

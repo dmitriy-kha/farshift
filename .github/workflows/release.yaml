@@ -8,7 +8,7 @@ on:
       version:
         description: Existing release tag
         required: true
-        default: v0.1.3
+        default: v0.1.4
         type: string
       deploy:
         description: Deploy to production after publishing
@@ -96,9 +96,6 @@ jobs:
           FARSHIFT_DOMAIN: ${{ vars.FARSHIFT_DOMAIN }}
           FARSHIFT_ACME_EMAIL: ${{ secrets.FARSHIFT_ACME_EMAIL }}
           FARSHIFT_STUN_URLS: ${{ vars.FARSHIFT_STUN_URLS }}
-          FARSHIFT_TURN_URLS: ${{ vars.FARSHIFT_TURN_URLS }}
-          FARSHIFT_TURN_SECRET: ${{ secrets.FARSHIFT_TURN_SECRET }}
-          FARSHIFT_RELAY_ONLY: ${{ vars.FARSHIFT_RELAY_ONLY }}
           FARSHIFT_MAX_ROOMS: ${{ vars.FARSHIFT_MAX_ROOMS }}
           FARSHIFT_MAX_CONNECTIONS: ${{ vars.FARSHIFT_MAX_CONNECTIONS }}
         run: bash deploy/github-release.sh deploy

@@ -98,7 +98,7 @@ case "${1:-}" in
     ;;
   deploy)
     for name in DEPLOY_SSH_KEY DEPLOY_HOST DEPLOY_PORT DEPLOY_USER DEPLOY_KNOWN_HOSTS \
-      FARSHIFT_DOMAIN FARSHIFT_ACME_EMAIL FARSHIFT_STUN_URLS FARSHIFT_RELAY_ONLY \
+      FARSHIFT_DOMAIN FARSHIFT_ACME_EMAIL FARSHIFT_STUN_URLS \
       FARSHIFT_MAX_ROOMS FARSHIFT_MAX_CONNECTIONS; do
       [[ -n ${!name:-} ]] || { printf 'Missing deployment setting: %s\n' "$name" >&2; exit 1; }
     done
@@ -109,9 +109,10 @@ case "${1:-}" in
     printf '%s\n' "$DEPLOY_SSH_KEY" > "$work/key"
     printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$work/known_hosts"
     chmod 600 "$work/key" "$work/known_hosts"
+    # Preserve the positional format understood by installed deployment scripts.
     values=("$FARSHIFT_IMAGE" "$FARSHIFT_NGINX_IMAGE" "$FARSHIFT_ACME_IMAGE" \
       "$FARSHIFT_DOMAIN" "$FARSHIFT_ACME_EMAIL" "$FARSHIFT_STUN_URLS" \
-      "${FARSHIFT_TURN_URLS:-}" "${FARSHIFT_TURN_SECRET:-}" "$FARSHIFT_RELAY_ONLY" \
+      "" "" "0" \
       "$FARSHIFT_MAX_ROOMS" "$FARSHIFT_MAX_CONNECTIONS" \
       "$FARSHIFT_REVISION" "$GITHUB_ACTOR" "$GH_TOKEN")
     for value in "${values[@]}"; do

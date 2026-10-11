@@ -11,7 +11,11 @@ async function timeout(promise, milliseconds) {
   } finally { clearTimeout(timer); }
 }
 export async function prepare() {
-  if (preparation) return preparation;
+  if (preparation) {
+    await preparation;
+    if (available()) return;
+    preparation = undefined;
+  }
   preparation = (async () => {
     ready = false;
     if (!navigator.serviceWorker) throw new Error('Service Worker is unavailable');
@@ -26,7 +30,7 @@ export async function prepare() {
   })();
   try { await preparation; } catch (error) { preparation = undefined; throw error; }
 }
-export function available() { return ready && Boolean(navigator.serviceWorker?.controller); }
+function available() { return ready && Boolean(navigator.serviceWorker?.controller); }
 export class Download {
   constructor(port, token) {
     Object.assign(this, { port, token, pending: null, cancelled: false, finished: false, frame: null, heartbeat: null, failure: null });

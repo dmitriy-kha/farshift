@@ -50,9 +50,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Reserved positions are consumed but never written to application settings.
 fields=(FARSHIFT_IMAGE FARSHIFT_NGINX_IMAGE FARSHIFT_ACME_IMAGE FARSHIFT_DOMAIN \
-  FARSHIFT_ACME_EMAIL FARSHIFT_STUN_URLS FARSHIFT_TURN_URLS FARSHIFT_TURN_SECRET \
-  FARSHIFT_RELAY_ONLY FARSHIFT_MAX_ROOMS FARSHIFT_MAX_CONNECTIONS FARSHIFT_REVISION \
+  FARSHIFT_ACME_EMAIL FARSHIFT_STUN_URLS RESERVED_A RESERVED_B RESERVED_C \
+  FARSHIFT_MAX_ROOMS FARSHIFT_MAX_CONNECTIONS FARSHIFT_REVISION \
   REGISTRY_USER REGISTRY_TOKEN)
 for name in "${fields[@]}"; do
   IFS= read -r -t 15 -n 8193 encoded || { echo 'Incomplete deployment request' >&2; exit 1; }
@@ -77,7 +78,8 @@ fi
 [[ $FARSHIFT_ACME_IMAGE =~ ^ghcr.io/dmitriy-kha/farshift-acme@sha256:[a-f0-9]{64}$ ]]
 [[ $FARSHIFT_DOMAIN == farshift.space ]]
 [[ $FARSHIFT_ACME_EMAIL =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]
-[[ $FARSHIFT_RELAY_ONLY =~ ^[01]$ && $FARSHIFT_REVISION =~ ^[a-f0-9]{40}$ ]]
+[[ -z $RESERVED_A && -z $RESERVED_B && $RESERVED_C == 0 ]]
+[[ $FARSHIFT_REVISION =~ ^[a-f0-9]{40}$ ]]
 for name in FARSHIFT_MAX_ROOMS FARSHIFT_MAX_CONNECTIONS; do
   [[ ${!name} =~ ^[1-9][0-9]{0,4}$ && ${!name} -le 32768 ]]
 done
@@ -103,6 +105,7 @@ docker_command rm "$container" >/dev/null
 container=''
 bash -n "$next/server-deploy.sh"
 for name in "${fields[@]:0:12}"; do
+  [[ $name != RESERVED_* ]] || continue
   printf "%s='%s'\n" "$name" "${!name}" >> "$next/.env"
 done
 compose() {
