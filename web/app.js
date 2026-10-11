@@ -1327,4 +1327,6 @@ document.addEventListener('visibilitychange', () => {
   if (!document.hidden) scheduleCountdown();
 });
 scheduleCountdown();
-window.addEventListener('pagehide', () => closeSession());
+// Hiding or suspending the tab must not clear the session.
+// If beforeunload is skipped, the browser closes the transports on destruction.
+window.addEventListener('beforeunload', () => closeSession());

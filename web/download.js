@@ -48,8 +48,8 @@ export class Download {
     };
     port.onmessageerror = () => this.abort('Download port failed');
     port.start();
-    this.onPageHide = () => this.abort('Page closed');
-    window.addEventListener('pagehide', this.onPageHide);
+    this.onBeforeUnload = () => this.abort('Page closed');
+    window.addEventListener('beforeunload', this.onBeforeUnload);
   }
   static async create(name, size) {
     if (!available() || typeof name !== 'string' || !name || new TextEncoder().encode(name).length > 1024 ||
@@ -121,6 +121,6 @@ export class Download {
     this.port.close();
     this.frame?.remove();
     this.frame = null;
-    window.removeEventListener('pagehide', this.onPageHide);
+    window.removeEventListener('beforeunload', this.onBeforeUnload);
   }
 }
