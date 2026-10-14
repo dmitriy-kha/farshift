@@ -15,9 +15,39 @@ services:
     security_opt: [no-new-privileges:true]
     environment:
       FARSHIFT_ORIGIN: https://${FARSHIFT_DOMAIN:?Set FARSHIFT_DOMAIN in deploy/.env}
-      FARSHIFT_STUN_URLS: ${FARSHIFT_STUN_URLS-stun:stun.l.google.com:19302,stun:global.stun.twilio.com:3478}
+      FARSHIFT_STUN_URLS: stun:stun.${FARSHIFT_DOMAIN:?Set FARSHIFT_DOMAIN in deploy/.env}:3478
       FARSHIFT_MAX_ROOMS: ${FARSHIFT_MAX_ROOMS:-32768}
       FARSHIFT_MAX_CONNECTIONS: ${FARSHIFT_MAX_CONNECTIONS:-32768}
+
+  # STUN discovers client addresses; TURN allocations and relays are disabled.
+  stun:
+    image: ${FARSHIFT_IMAGE:?Set FARSHIFT_IMAGE to a published image digest}
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      disable: true
+    entrypoint: ["/usr/bin/turnserver"]
+    command:
+      - -n
+      - --stun-only
+      - --no-udp-relay
+      - --no-tcp-relay
+      - --no-tcp
+      - --no-tls
+      - --no-dtls
+      - --no-cli
+      - --listening-ip=0.0.0.0
+      - --listening-port=3478
+      - --log-file=stdout
+      - --pidfile=/tmp/turnserver.pid
+      - --userdb=/tmp/turndb
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m,mode=1777
+    ports:
+      - "3478:3478/udp"
 
   nginx:
     image: ${FARSHIFT_NGINX_IMAGE:?Set FARSHIFT_NGINX_IMAGE to a published image digest}

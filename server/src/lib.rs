@@ -46,10 +46,7 @@ impl Default for Config {
             bind: "127.0.0.1:8080".into(),
             origin: "http://127.0.0.1:8080".into(),
             web_dir: "web".into(),
-            stun_urls: vec![
-                "stun:stun.l.google.com:19302".into(),
-                "stun:global.stun.twilio.com:3478".into(),
-            ],
+            stun_urls: Vec::new(),
             max_rooms: MAX_PARTICIPANTS,
             max_connections: MAX_PARTICIPANTS,
         }
