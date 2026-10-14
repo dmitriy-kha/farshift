@@ -33,12 +33,9 @@ services:
     command:
       - -n
       - --stun-only
-      - --no-udp-relay
-      - --no-tcp-relay
       - --no-tcp
       - --no-tls
       - --no-dtls
-      - --no-cli
       - --listening-ip=0.0.0.0
       - --listening-port=3478
       - --log-file=stdout
