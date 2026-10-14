@@ -105,7 +105,8 @@ export class Download {
     if (!(bytes instanceof Uint8Array) || !bytes.length || bytes.length > CHUNK_LIMIT) throw new Error('Invalid chunk size');
     // Respect the active worker's batch limit while an updated worker is installing.
     for (let offset = 0; offset < bytes.length; offset += this.chunkLimit) {
-      const buffer = bytes.slice(offset, offset + this.chunkLimit).buffer;
+      const buffer = offset === 0 && bytes.length <= this.chunkLimit && bytes.byteOffset === 0
+        && bytes.byteLength === bytes.buffer.byteLength ? bytes.buffer : bytes.slice(offset, offset + this.chunkLimit).buffer;
       await this.request('ack', () => this.port.postMessage({ type: 'chunk', bytes: buffer }, [buffer]));
     }
   }

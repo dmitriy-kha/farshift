@@ -1,6 +1,6 @@
 import { validRoom, validSecret, normalizeCode, randomSecret, Pairing } from './protocol.js';
 import { prepare, Download } from './download.js';
-import { CHUNK, TRANSFER_WINDOW, WRITE_BATCH, ACK_BYTES, CHANNEL_HIGH_WATER, CHANNEL_LOW_WATER } from './transfer-config.js';
+import { CHUNK, TRANSFER_WINDOW, WRITE_BATCH, WRITE_DELAY, ACK_BYTES, CHANNEL_HIGH_WATER, CHANNEL_LOW_WATER } from './transfer-config.js';
 
 const animationSettings = {
   code_min_delay_ms: 100, code_random_range_ms: 220, code_tick_ms: 50,
@@ -28,9 +28,9 @@ try {
   console.warn('Using default animation settings:', error);
 } finally { clearTimeout(animationTimeout); }
 
-const SPEED_DURATION = 2000;
-const SPEED_MAX_BYTES = 64 * 1024 * 1024;
-const SPEED_TIMEOUT = 15000;
+const SPEED_DURATION = 5000;
+const SPEED_MAX_BYTES = 256 * 1024 * 1024;
+const SPEED_TIMEOUT = 30000;
 const SPEED_COOLDOWN = 30000;
 const MAX_LOCAL_ENTRIES = 10000;
 const MAX_FILES = MAX_LOCAL_ENTRIES * 2;
@@ -43,6 +43,8 @@ const TRANSFER_IDLE_TIMEOUT = 30000;
 const TRANSFER_WRITE_TIMEOUT = 60000;
 const SIGNAL_OPEN_TIMEOUT = 15000;
 const CHANNEL_OPEN_TIMEOUT = 45000;
+const ICE_RESTART_TIMEOUT = 20000;
+const MAX_ICE_RESTARTS = 2;
 const DEFAULT_TTL = 60 * 60;
 const MAX_TTL = 999 * 60;
 // Keep elapsed time independent of device clock corrections during a session.
@@ -52,7 +54,7 @@ let filesRenderFrame = null;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder('utf-8', { fatal: true });
 const app = {
-  generation: 0, ws: null, pc: null, channel: null, role: '', room: '', secret: '',
+  generation: 0, ws: null, pc: null, channel: null, dataChannel: null, channelStarted: false, role: '', room: '', secret: '',
   peer: '', peerSecret: '', attempts: [], pairing: null, pakeMessage: null, session: null,
   paired: false, peerReady: false, expiresAt: 0, pairingDeadline: 0,
   localExpiresAt: 0, localPairingDeadline: 0, configuration: null,
@@ -63,8 +65,10 @@ const app = {
   clock: 0, files: new Map(), local: new Map(), created: new Set(), expanded: new Set(), replace: null, outgoing: null,
   incoming: null, folderDownload: null, directoryImport: null,
   preparingDownload: false, receivingDone: false, disconnectedAt: 0,
-  controlQueue: [], controlQueueBytes: 0, sendingControl: false,
+  controlQueue: [], urgentControlQueue: [], controlQueueBytes: 0, sendingControl: false,
   speedTest: null, speedRates: { upload: null, download: null }, lastSpeedTest: 0,
+  restartingAt: 0, restartAttempts: 0, restartBusy: false, remoteIceGeneration: 0, iceGeneration: 0,
+  routeAt: 0, routeBusy: false,
 };
 const element = id => document.getElementById(id);
 const text = (id, value) => { element(id).textContent = value; };
@@ -164,7 +168,8 @@ function controlSend(value) {
     closeSession('Folder update queue limit exceeded');
     throw Error('Folder update queue limit exceeded');
   }
-  app.controlQueue.push({ payload, size }); app.controlQueueBytes += size;
+  const urgent = ['start', 'ack', 'done', 'received', 'cancel', 'error', 'speed_ready', 'speed_end', 'speed_result', 'speed_cancel', 'speed_busy'].includes(value.type);
+  (urgent ? app.urgentControlQueue : app.controlQueue).push({ payload, size }); app.controlQueueBytes += size;
   if (!app.sendingControl) flushControl();
 }
 function waitForBuffer(channel, generation) {
@@ -180,7 +185,7 @@ function waitForBuffer(channel, generation) {
     };
     const drained = () => finish(!current(generation) || channel.readyState !== 'open' ? Error('Channel closed') : null);
     const closed = () => finish(Error('Channel closed'));
-    const timer = setTimeout(() => finish(Error('Transfer is not responding')), TRANSFER_IDLE_TIMEOUT);
+    const timer = setTimeout(() => finish(Error('Transfer is not responding')), TRANSFER_WRITE_TIMEOUT);
     channel.addEventListener('bufferedamountlow', drained);
     channel.addEventListener('close', closed);
     channel.addEventListener('error', closed);
@@ -191,15 +196,16 @@ async function flushControl() {
   const channel = app.channel;
   const generation = app.generation;
   const queue = app.controlQueue;
+  const urgent = app.urgentControlQueue;
   app.sendingControl = true;
   try {
     let index = 0;
-    while (index < queue.length) {
+    while (index < queue.length || urgent.length) {
       await waitForBuffer(channel, generation);
       if (!current(generation) || channel.readyState !== 'open') return;
-      const item = queue[index];
+      const item = urgent.length ? urgent.shift() : queue[index];
       channel.send(item.payload); app.controlQueueBytes -= item.size;
-      queue[index++] = null;
+      if (item === queue[index]) queue[index++] = null;
       // Release sent payloads immediately and keep the consumed prefix bounded.
       if (index >= 256) { queue.splice(0, index); index = 0; }
     }
@@ -222,6 +228,8 @@ async function signalSend(value, generation) {
   wsSend({ type: 'signal', payload });
 }
 function abortReceiver(receiver) {
+  clearTimeout(receiver?.batchTimer);
+  receiver?.flushBatch?.();
   receiver?.reject?.(Error('Transfer cancelled or could not be saved'));
   if (receiver?.queue) receiver.queue.length = 0;
   try { if (receiver?.writer) Promise.resolve(receiver.writer.abort()).catch(() => {}); } catch {}
@@ -246,15 +254,16 @@ function closeSession(message = '') {
   clearTransfer();
   if (filesRenderFrame !== null) cancelAnimationFrame(filesRenderFrame);
   filesRenderFrame = null;
-  app.controlQueue = []; app.controlQueueBytes = 0; app.sendingControl = false;
+  app.controlQueue = []; app.urgentControlQueue = []; app.controlQueueBytes = 0; app.sendingControl = false;
   app.generation++;
-  for (const object of [app.ws, app.channel, app.pc]) {
+  for (const object of [app.ws, app.channel, app.dataChannel, app.pc]) {
     if (!object) continue;
     for (const name of ['onmessage', 'onopen', 'onclose', 'onerror', 'ondatachannel', 'onconnectionstatechange', 'onicecandidate', 'onicecandidateerror', 'onicegatheringstatechange', 'oniceconnectionstatechange']) object[name] = null;
     try { object.close(); } catch {}
   }
   app.session?.destroy?.(); app.pairing?.destroy?.();
-  app.ws = app.channel = app.pc = app.session = app.pairing = null;
+  app.ws = app.channel = app.dataChannel = app.pc = app.session = app.pairing = null;
+  app.channelStarted = false;
   app.pakeMessage?.fill(0); app.pakeMessage = null;
   app.secret = app.peerSecret = app.peer = app.room = app.role = '';
   app.configuration = null; app.files.clear(); app.local.clear(); app.created.clear(); app.expanded.clear(); app.replace = null; app.directoryImport = null;
@@ -265,6 +274,8 @@ function closeSession(message = '') {
   app.signalingAt = app.connectingAt = 0; app.remoteCandidates = [];
   app.ice = { local: 0, remote: 0, public: 0, stunFailed: false };
   app.preparingDownload = app.receivingDone = false; app.disconnectedAt = 0;
+  app.restartingAt = app.restartAttempts = app.remoteIceGeneration = app.iceGeneration = 0;
+  app.restartBusy = app.routeBusy = false; app.routeAt = 0;
   app.speedRates = { upload: null, download: null }; updateSpeedUI(); hidden('speed-row', true);
   showCode(''); text('files', ''); text('timer', 'TTL --:--');
   clearJoinCode();
@@ -278,7 +289,7 @@ function securityFailure() {
   closeSession('Code or confirmation incorrect. Folder closed. Get a new code.');
 }
 function preserveDirectConnection(ws) {
-  if (!app.lifetimeConfirmed || app.channel?.readyState !== 'open') return false;
+  if (!app.lifetimeConfirmed || !channelsOpen()) return false;
   if (!ws) return true;
   ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null;
   if (app.ws === ws) app.ws = null;
@@ -457,7 +468,7 @@ function directConnectionFailure() {
 }
 function connectionProgress() {
   const pc = app.pc;
-  if (!pc || app.channel?.readyState === 'open') return;
+  if (!pc || app.channelStarted) return;
   if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
     status('Opening file channel'); notice('Direct route found. Opening the secure file channel.');
   } else if (pc.iceConnectionState === 'checking') {
@@ -484,14 +495,14 @@ function setupPeer() {
       if (event.candidate.type === 'srflx' || /\btyp srflx\b/.test(event.candidate.candidate)) app.ice.public++;
     }
     if (!app.ws && app.channel?.readyState === 'open') return;
-    signalSend({ type: 'candidate', candidate: event.candidate?.toJSON() ?? null }, generation)
+    signalSend({ type: 'candidate', candidate: event.candidate?.toJSON() ?? null, generation: app.iceGeneration }, generation)
       .catch(() => { if (current(generation)) closeSession('Could not send WebRTC connection details.'); });
   };
   pc.onicecandidateerror = () => { if (current(generation)) app.ice.stunFailed = true; };
   pc.onicegatheringstatechange = () => { if (current(generation)) connectionProgress(); };
   pc.oniceconnectionstatechange = () => {
     if (!current(generation)) return;
-    if (pc.iceConnectionState === 'failed') closeSession(directConnectionFailure());
+    if (pc.iceConnectionState === 'failed') recoverConnection();
     else connectionProgress();
   };
   pc.ondatachannel = event => {
@@ -501,7 +512,7 @@ function setupPeer() {
   pc.onconnectionstatechange = () => {
     if (!current(generation)) return;
     switch (pc.connectionState) {
-      case 'failed': closeSession(directConnectionFailure()); break;
+      case 'failed': recoverConnection(); break;
       case 'closed': closeSession('Direct connection closed. Get new codes on both devices.'); break;
       case 'disconnected':
         if (!app.disconnectedAt) app.disconnectedAt = sessionNow();
@@ -509,7 +520,12 @@ function setupPeer() {
         notice('Direct connection interrupted. Waiting up to 30 seconds for the route to recover.'); renderFiles(); break;
       case 'connected':
         app.disconnectedAt = 0;
-        if (app.channel?.readyState === 'open') { status('Both devices online', 'connected'); notice(''); }
+        if (pc.signalingState === 'stable') app.restartingAt = 0;
+        for (const transfer of [app.outgoing, app.incoming]) if (transfer) transfer.activity = sessionNow();
+        if (channelsOpen()) {
+          app.restartAttempts = 0;
+          status('Both devices online', 'connected'); notice(''); updateRoute();
+        }
         else connectionProgress();
         renderFiles(); break;
     }
@@ -531,9 +547,13 @@ function validCandidate(candidate) {
 }
 async function applyCandidates(pc, generation) {
   // Candidates can arrive before the authenticated offer or answer.
-  while (app.remoteCandidates.length && current(generation)) {
-    const candidate = app.remoteCandidates.shift();
-    await rtc(() => pc.addIceCandidate(candidate), 'Applying a direct network address');
+  const pending = app.remoteCandidates;
+  app.remoteCandidates = [];
+  for (const item of pending) {
+    if (!current(generation)) return;
+    if (item.generation > app.remoteIceGeneration) { app.remoteCandidates.push(item); continue; }
+    if (item.generation < app.remoteIceGeneration) continue;
+    await rtc(() => pc.addIceCandidate(item.candidate), 'Applying a direct network address');
   }
 }
 async function createOffer(generation) {
@@ -542,10 +562,46 @@ async function createOffer(generation) {
   const channel = await rtc(() => pc.createDataChannel('folder', { ordered: true }), 'Creating the file channel');
   if (!current(generation)) return;
   attachChannel(channel);
+  const dataChannel = await rtc(() => pc.createDataChannel('files', { ordered: true }), 'Creating the data channel');
+  if (!current(generation)) return;
+  attachChannel(dataChannel);
   const offer = await rtc(() => pc.createOffer(), 'Preparing connection details');
   if (!current(generation)) return;
   await rtc(() => pc.setLocalDescription(offer), 'Applying local connection details');
-  if (current(generation)) await signalSend({ type: 'offer', sdp: localSdp(pc) }, generation);
+  if (current(generation)) await signalSend({ type: 'offer', sdp: localSdp(pc), generation: 0 }, generation);
+}
+function recoverConnection() {
+  if (!app.pc || app.restartingAt || app.restartBusy) return;
+  if (!app.pc.remoteDescription || app.pc.signalingState !== 'stable') {
+    if (app.connectingAt && sessionNow() - app.connectingAt >= CHANNEL_OPEN_TIMEOUT) closeSession(directConnectionFailure());
+    return;
+  }
+  if (app.ws?.readyState !== WebSocket.OPEN || app.restartAttempts >= MAX_ICE_RESTARTS) {
+    closeSession(directConnectionFailure()); return;
+  }
+  app.restartAttempts++;
+  app.restartingAt = sessionNow();
+  status('Restoring direct connection'); text('route', 'restoring direct connection');
+  notice('Trying a new direct route. Keep both devices online.');
+  const generation = app.generation;
+  if (app.role === 'b') {
+    signalSend({ type: 'restart' }, generation).catch(() => {
+      if (current(generation)) closeSession('Could not request a new direct route.');
+    });
+    return;
+  }
+  app.restartBusy = true;
+  const pc = app.pc;
+  (async () => {
+    app.iceGeneration++;
+    const offer = await rtc(() => pc.createOffer({ iceRestart: true }), 'Preparing a new direct route');
+    if (!current(generation)) return;
+    app.restartingAt = sessionNow();
+    await rtc(() => pc.setLocalDescription(offer), 'Applying a new direct route');
+    if (current(generation)) await signalSend({ type: 'offer', sdp: localSdp(pc), generation: app.iceGeneration }, generation);
+  })().catch(error => {
+    if (current(generation)) closeSession(errorText(error));
+  }).finally(() => { if (current(generation)) app.restartBusy = false; });
 }
 async function handleSignal(value, generation) {
   if (!current(generation)) return;
@@ -567,47 +623,70 @@ async function handleSignal(value, generation) {
     return;
   }
   if (!app.lifetimeConfirmed) throw Error('Lifetime not confirmed');
+  if (value?.type === 'restart') {
+    if (app.role !== 'a' || !app.pc?.remoteDescription) throw Error('Invalid route recovery');
+    recoverConnection(); return;
+  }
   if (value?.type === 'candidate') {
-    if (!validCandidate(value.candidate) || app.remoteCandidates.length >= 256) throw Error('Invalid ICE candidate');
+    if (value.generation === undefined) throw new WebRTCError('The other device is using an older client. Refresh both devices before connecting.');
+    if (!unsigned(value.generation) || value.generation > app.remoteIceGeneration + 1
+      || !validCandidate(value.candidate) || app.remoteCandidates.length >= 256) throw Error('Invalid ICE candidate');
+    if (value.generation < app.remoteIceGeneration) return;
     if (value.candidate) {
       if (value.candidate.candidate && !/\btyp (host|srflx|prflx)\b/.test(value.candidate.candidate)) throw new WebRTCError('The other device supplied an unsupported network address. Refresh both devices.');
       if (value.candidate.candidate) app.ice.remote++;
     }
-    app.remoteCandidates.push(value.candidate);
+    app.remoteCandidates.push({ candidate: value.candidate, generation: value.generation });
     if (app.pc?.remoteDescription) await applyCandidates(app.pc, generation);
     return;
   }
   const sdp = value?.sdp;
+  if (value.generation === undefined) throw new WebRTCError('The other device is using an older client. Refresh both devices before connecting.');
+  if (!unsigned(value.generation)) throw Error('Invalid route generation');
   if (typeof sdp !== 'string' || byteLength(sdp) > 128 * 1024 || !sdp.includes('a=fingerprint:')) throw Error('Missing DTLS fingerprint');
   if ((sdp.match(/^a=candidate:.*$/gm) || []).some(candidate => !/\btyp (host|srflx|prflx)\b/.test(candidate))) throw new WebRTCError('The other device supplied an unsupported network address. Refresh both devices.');
   app.ice.remote += (sdp.match(/^a=candidate:/gm) || []).length;
   if (value.type === 'offer' && app.role === 'b') {
-    const pc = setupPeer(); await rtc(() => pc.setRemoteDescription({ type: 'offer', sdp }), 'Applying the other device\'s connection details');
+    const pc = app.pc || setupPeer();
+    if (pc.remoteDescription ? value.generation !== app.remoteIceGeneration + 1 : value.generation !== 0) throw Error('Invalid connection offer');
+    if (value.generation > 0) {
+      app.restartingAt = sessionNow();
+      status('Restoring direct connection');
+    }
+    app.remoteIceGeneration = app.iceGeneration = value.generation;
+    await rtc(() => pc.setRemoteDescription({ type: 'offer', sdp }), 'Applying the other device\'s connection details');
     if (!current(generation)) return;
     await applyCandidates(pc, generation);
     const answer = await rtc(() => pc.createAnswer(), 'Preparing the connection response');
     if (!current(generation)) return;
     await rtc(() => pc.setLocalDescription(answer), 'Applying the connection response');
-    if (current(generation)) await signalSend({ type: 'answer', sdp: localSdp(pc) }, generation);
+    if (current(generation)) await signalSend({ type: 'answer', sdp: localSdp(pc), generation: value.generation }, generation);
   } else if (value.type === 'answer' && app.role === 'a') {
-    if (!app.pc || app.pc.remoteDescription) throw Error('Invalid answer');
+    if (!app.pc || app.pc.signalingState !== 'have-local-offer' || value.generation !== app.iceGeneration) throw Error('Invalid answer');
+    app.remoteIceGeneration = value.generation;
     await rtc(() => app.pc.setRemoteDescription({ type: 'answer', sdp }), 'Applying the other device\'s connection response');
     if (current(generation)) await applyCandidates(app.pc, generation);
   } else throw Error('Invalid SDP');
+  if (current(generation) && app.pc?.connectionState === 'connected' && app.pc.signalingState === 'stable') {
+    app.restartingAt = app.disconnectedAt = 0;
+    if (channelsOpen()) app.restartAttempts = 0;
+    for (const transfer of [app.outgoing, app.incoming]) if (transfer) transfer.activity = sessionNow();
+  }
 }
 function attachChannel(channel) {
-  if (app.channel || channel.label !== 'folder' || !channel.ordered || channel.maxRetransmits !== null || channel.maxPacketLifeTime !== null) throw Error('Invalid channel');
-  app.channel = channel; channel.binaryType = 'arraybuffer';
+  const slot = channel.label === 'folder' ? 'channel' : channel.label === 'files' ? 'dataChannel' : null;
+  if (!slot || app[slot] || !channel.ordered || channel.maxRetransmits !== null || channel.maxPacketLifeTime !== null) throw Error('Invalid channel');
+  app[slot] = channel; channel.binaryType = 'arraybuffer';
   channel.bufferedAmountLowThreshold = CHANNEL_LOW_WATER;
   const generation = app.generation;
   channel.onopen = () => { if (current(generation)) channelReady(); };
   channel.onmessage = event => {
     if (!current(generation)) return;
     try {
-      if (typeof event.data === 'string') {
+      if (slot === 'channel' && typeof event.data === 'string') {
         if (byteLength(event.data) > MAX_CONTROL) throw Error('Message size limit exceeded');
         handleControl(parseControl(event.data), generation);
-      } else if (event.data instanceof ArrayBuffer && event.data.byteLength <= CHUNK + 40) {
+      } else if (slot === 'dataChannel' && event.data instanceof ArrayBuffer && event.data.byteLength <= CHUNK + 40) {
         receiveChunk(event.data, generation);
       } else throw Error('Invalid file chunk');
     } catch (error) { closeSession(errorText(error)); }
@@ -616,13 +695,42 @@ function attachChannel(channel) {
   channel.onerror = () => { if (current(generation)) closeSession('The direct file channel failed. Get new codes on both devices.'); };
   if (channel.readyState === 'open') channelReady();
 }
+function channelsOpen() {
+  return app.channel?.readyState === 'open' && app.dataChannel?.readyState === 'open';
+}
 function channelReady() {
+  if (!channelsOpen() || app.channelStarted) return;
   if (!app.paired || !app.lifetimeConfirmed || sessionNow() >= Math.min(app.expiresAt, app.localExpiresAt) || !app.pc?.remoteDescription) { securityFailure(); return; }
+  app.channelStarted = true;
+  app.restartAttempts = 0;
   app.connectingAt = 0;
   text('route', 'direct connection');
   status('Both devices online', 'connected'); tick(); hidden('folder', false); notice('');
   hidden('speed-row', false); updateSpeedUI();
-  renderFiles(); sendInventory();
+  renderFiles(); sendInventory(); updateRoute();
+}
+async function updateRoute() {
+  const pc = app.pc;
+  if (!pc || app.routeBusy || pc.connectionState !== 'connected' || !channelsOpen()) return;
+  const generation = app.generation;
+  app.routeBusy = true; app.routeAt = sessionNow();
+  try {
+    const stats = await pc.getStats();
+    if (!current(generation) || pc.connectionState !== 'connected') return;
+    let pair;
+    for (const report of stats.values()) {
+      if (report.type === 'transport' && report.selectedCandidatePairId) pair = stats.get(report.selectedCandidatePairId);
+    }
+    if (!pair) pair = Array.from(stats.values()).find(report => report.type === 'candidate-pair'
+      && report.state === 'succeeded' && report.nominated);
+    if (!pair) return;
+    const local = stats.get(pair.localCandidateId), remote = stats.get(pair.remoteCandidateId);
+    const route = ['direct', local?.protocol, local?.candidateType && remote?.candidateType
+      ? `${local.candidateType} ↔ ${remote.candidateType}` : null];
+    if (Number.isFinite(pair.currentRoundTripTime)) route.push(`${Math.round(pair.currentRoundTripTime * 1000)} ms`);
+    text('route', route.filter(Boolean).join(' · '));
+  } catch { /* Route statistics are optional and never interrupt file transfers. */ }
+  finally { if (current(generation)) app.routeBusy = false; }
 }
 const entryKind = entry => entry.kind === undefined ? 'file' : entry.kind;
 const entryParent = entry => entry.parent ?? null;
@@ -751,8 +859,13 @@ function handleControl(value, generation) {
       sender.startedAck = true; sender.acknowledged = value.offset; sender.activity = sessionNow();
       transferProgress(false); pumpTransfer(sender, generation); break;
     }
-    case 'done':
+    case 'done': {
+      const receiver = app.incoming;
+      if (receiver?.transfer !== value.transfer) break;
+      if (receiver.speed || receiver.endSignal) throw Error('Invalid transfer completion');
+      receiver.endSignal = true;
       finishDownload(value.transfer, generation).catch(error => { if (current(generation)) closeSession(errorText(error)); }); break;
+    }
     case 'received': {
       const sender = app.outgoing;
       if (!sender || sender.transfer !== value.transfer) return;
@@ -808,7 +921,7 @@ function pumpTransfer(sender, generation) {
 async function sendChunks(sender, generation) {
   if (!current(generation) || app.outgoing !== sender || sender.busy || sender.finishing) return;
   sender.busy = true;
-  const channel = app.channel;
+  const channel = app.dataChannel;
   const header = encoder.encode(sender.transfer);
   try {
     while (current(generation) && app.outgoing === sender) {
@@ -816,12 +929,26 @@ async function sendChunks(sender, generation) {
       const remaining = Math.min(sender.size - sender.offset, TRANSFER_WINDOW - (sender.offset - sender.acknowledged));
       if (!remaining) break;
       const start = sender.offset;
-      const length = Math.min(WRITE_BATCH, remaining);
+      let length = Math.min(WRITE_BATCH, remaining);
       sender.activity = sessionNow();
-      const bytes = sender.speed ? sender.pattern.subarray(0, length) : new Uint8Array(await sender.file.slice(start, start + length).arrayBuffer());
+      let bytes;
+      if (sender.speed) bytes = sender.pattern.subarray(0, length);
+      else {
+        if (!sender.readBuffer || start >= sender.readBuffer.offset + sender.readBuffer.bytes.length) {
+          const batch = await (sender.readAhead || readTransferBatch(sender, start));
+          if (!current(generation) || app.outgoing !== sender) return;
+          if (batch.error) throw batch.error;
+          sender.readBuffer = batch;
+          const next = batch.offset + batch.bytes.length;
+          sender.readAhead = next < sender.size ? readTransferBatch(sender, next) : null;
+        }
+        const index = start - sender.readBuffer.offset;
+        length = Math.min(length, sender.readBuffer.bytes.length - index);
+        bytes = sender.readBuffer.bytes.subarray(index, index + length);
+      }
       if (bytes.length !== length) throw Error('File changed or unavailable');
       for (let index = 0; index < length; index += CHUNK) {
-        await waitForBuffer(channel, generation);
+        if (channel.readyState !== 'open' || channel.bufferedAmount > CHANNEL_HIGH_WATER) await waitForBuffer(channel, generation);
         if (!current(generation) || app.outgoing !== sender) return;
         if (sender.speed && performance.now() - sender.sampleStarted >= SPEED_DURATION) break;
         const chunk = bytes.subarray(index, Math.min(index + CHUNK, length));
@@ -833,6 +960,7 @@ async function sendChunks(sender, generation) {
     }
     if (!current(generation) || app.outgoing !== sender) return;
     if (sender.offset === sender.size || (sender.speed && performance.now() - sender.sampleStarted >= SPEED_DURATION)) {
+      sender.readBuffer = sender.readAhead = null;
       sender.finishing = true; sender.activity = sessionNow();
       if (sender.speed) {
         sender.size = sender.offset; app.speedTest.phase = 'await_result'; app.speedTest.activity = sessionNow();
@@ -847,9 +975,18 @@ async function sendChunks(sender, generation) {
     if (current(generation) && app.outgoing === sender) transferProgress(false);
   }
 }
+async function readTransferBatch(sender, offset) {
+  try {
+    const end = Math.min(offset + WRITE_BATCH, sender.size);
+    const bytes = new Uint8Array(await sender.file.slice(offset, end).arrayBuffer());
+    if (bytes.length !== end - offset) throw Error('File changed or unavailable');
+    return { offset, bytes };
+  } catch (error) { return { error }; }
+}
 function receiverState(fields) {
   return { ...fields, offset: 0, receivedOffset: 0, acknowledged: 0, queue: [], queuedBytes: 0,
-    busy: false, drain: null, endReceived: false, startedAck: false, started: sessionNow(), activity: sessionNow() };
+    busy: false, drain: null, batchTimer: null, flushBatch: null, endSignal: false,
+    endReceived: false, startedAck: false, started: sessionNow(), activity: sessionNow() };
 }
 function acknowledge(receiver, force = false) {
   if (!force && receiver.offset - receiver.acknowledged < ACK_BYTES && receiver.offset !== receiver.size) return;
@@ -875,22 +1012,42 @@ function receiveChunk(buffer, generation) {
     const now = performance.now();
     if (receiver.firstByteAt === undefined) receiver.firstByteAt = now;
     receiver.lastByteAt = now; receiver.offset += length;
-    acknowledge(receiver); return;
+    acknowledge(receiver);
+    if (receiver.speedEnd && receiver.receivedOffset === receiver.speedEnd.size) finishSpeedReceive(receiver.speedEnd);
+    return;
   }
   if (!receiver.download && !receiver.writer) throw Error('Download destination is unavailable');
   receiver.queue.push(bytes); receiver.queuedBytes += length;
-  if (!receiver.drain) {
-    receiver.drain = drainReceiver(receiver, generation).catch(error => {
-      if (current(generation) && app.incoming === receiver) {
-        tryControl({ type: 'cancel', transfer }); cancelOne(transfer, `Could not write file: ${errorText(error)}`);
-      }
-    }).finally(() => { receiver.drain = null; });
+  scheduleReceiverWrite(receiver, generation);
+  if (receiver.endSignal && receiver.receivedOffset === receiver.size) {
+    finishDownload(transfer, generation).catch(error => { if (current(generation)) closeSession(errorText(error)); });
   }
+}
+function scheduleReceiverWrite(receiver, generation) {
+  if (!receiver.drain) {
+    const ready = new Promise(resolve => {
+      receiver.flushBatch = resolve;
+      receiver.batchTimer = setTimeout(resolve, WRITE_DELAY);
+    });
+    receiver.drain = ready.then(() => {
+      clearTimeout(receiver.batchTimer); receiver.batchTimer = null; receiver.flushBatch = null;
+      if (current(generation) && app.incoming === receiver) return drainReceiver(receiver, generation);
+    }).catch(error => {
+      if (current(generation) && app.incoming === receiver) {
+        tryControl({ type: 'cancel', transfer: receiver.transfer });
+        cancelOne(receiver.transfer, `Could not write file: ${errorText(error)}`);
+      }
+    }).finally(() => {
+      receiver.drain = null;
+      if (receiver.queue.length && current(generation) && app.incoming === receiver) scheduleReceiverWrite(receiver, generation);
+    });
+  }
+  if (receiver.queuedBytes >= WRITE_BATCH || receiver.receivedOffset === receiver.size) receiver.flushBatch?.();
 }
 async function drainReceiver(receiver, generation) {
   receiver.busy = true;
   try {
-    while (receiver.queue.length && current(generation) && app.incoming === receiver) {
+    if (receiver.queue.length && current(generation) && app.incoming === receiver) {
       const chunks = []; let length = 0;
       while (receiver.queue.length && length + receiver.queue[0].length <= WRITE_BATCH) {
         const chunk = receiver.queue.shift(); chunks.push(chunk); length += chunk.length;
@@ -911,10 +1068,15 @@ async function drainReceiver(receiver, generation) {
 async function finishDownload(transfer, generation) {
   if (!current(generation)) return;
   const receiver = app.incoming;
-  if (!receiver || receiver.transfer !== transfer) return;
-  if (receiver.speed || !receiver.startedAck || receiver.receivedOffset !== receiver.size || receiver.endReceived) throw Error('Invalid transfer completion');
+  if (!receiver || receiver.transfer !== transfer || receiver.endReceived) return;
+  if (receiver.speed || !receiver.startedAck) throw Error('Invalid transfer completion');
+  // Commands and payloads use different streams and can arrive in either order.
+  if (!receiver.endSignal || receiver.receivedOffset !== receiver.size) return;
   receiver.endReceived = true; app.receivingDone = true;
-  if (receiver.drain) await receiver.drain;
+  while (receiver.drain) {
+    receiver.flushBatch?.();
+    await receiver.drain;
+  }
   if (!current(generation) || app.incoming !== receiver) return;
   if (receiver.offset !== receiver.size || receiver.queuedBytes || receiver.busy) throw Error('Incomplete transfer');
   receiver.busy = true; receiver.activity = sessionNow();
@@ -1064,8 +1226,8 @@ async function downloadFolder(id) {
       if (local) {
         job.progress = { name: entry.name, size: entry.size, offset: 0, started: sessionNow() };
         transferProgress(true);
-        for (let offset = 0; offset < entry.size; offset += CHUNK) {
-          const end = Math.min(offset + CHUNK, entry.size);
+        for (let offset = 0; offset < entry.size; offset += WRITE_BATCH) {
+          const end = Math.min(offset + WRITE_BATCH, entry.size);
           const bytes = await local.slice(offset, end).arrayBuffer();
           checkFolderDownload(job, entry);
           if (bytes.byteLength !== end - offset) throw Error('File changed or unavailable');
@@ -1092,7 +1254,7 @@ async function downloadFolder(id) {
   }
 }
 function speedAvailable() {
-  return app.channel?.readyState === 'open' && app.pc?.connectionState === 'connected'
+  return channelsOpen() && app.pc?.connectionState === 'connected'
     && !app.outgoing && !app.incoming && !app.folderDownload && !app.preparingDownload && !app.receivingDone;
 }
 function speedRate(value) { return value === null ? '--.-' : value.toFixed(1); }
@@ -1144,7 +1306,11 @@ function finishSpeedReceive(value) {
   const job = app.speedTest, receiver = app.incoming;
   if (job?.transfer !== value.transfer) return;
   if (!receiver?.speed || job.phase !== 'receiving' || value.size > SPEED_MAX_BYTES
-    || value.size !== receiver.receivedOffset) throw Error('Invalid speed test completion');
+    || value.size < receiver.receivedOffset || (value.size && value.size % CHUNK)) throw Error('Invalid speed test completion');
+  if (receiver.speedEnd && receiver.speedEnd !== value) throw Error('Duplicate speed test completion');
+  receiver.speedEnd = value;
+  receiver.size = value.size;
+  if (value.size !== receiver.receivedOffset) return;
   const duration = Math.max(1, Math.ceil((receiver.lastByteAt ?? performance.now()) - (receiver.firstByteAt ?? performance.now())));
   if (duration > SPEED_TIMEOUT) { stopSpeedTest('Speed test timed out'); return; }
   const measured = Math.max(0, value.size - CHUNK);
@@ -1408,18 +1574,29 @@ function tick() {
     closeSession('The pairing server did not issue a code within 15 seconds. Check your connection and try again.'); return;
   }
   if (app.connectingAt && sessionNow() - app.connectingAt > CHANNEL_OPEN_TIMEOUT) {
-    closeSession(directConnectionFailure()); return;
+    if (!app.restartingAt) recoverConnection();
+    if (!app.pc) return;
   }
-  if (app.disconnectedAt && sessionNow() - app.disconnectedAt > 30000) {
-    closeSession('Direct connection did not recover. Check the network and get new codes.'); return;
+  if (app.restartingAt && sessionNow() - app.restartingAt > ICE_RESTART_TIMEOUT) {
+    app.restartingAt = 0;
+    if (app.pc?.signalingState !== 'stable') {
+      closeSession('The other device did not answer the direct route recovery request.'); return;
+    }
+    recoverConnection();
+    if (!app.pc) return;
   }
+  if (app.disconnectedAt && sessionNow() - app.disconnectedAt > 3000 && !app.restartingAt) {
+    recoverConnection();
+    if (!app.pc) return;
+  }
+  if (app.channelStarted && sessionNow() - app.routeAt > 2000) updateRoute();
   if (app.incoming?.download?.cancelled) {
     const transfer = app.incoming.transfer; tryControl({ type: 'cancel', transfer }); cancelOne(transfer, 'Download cancelled in browser');
   }
   for (const direction of ['incoming', 'outgoing']) {
     const transfer = app[direction];
     const timeout = transfer?.busy || transfer?.finishing ? TRANSFER_WRITE_TIMEOUT : TRANSFER_IDLE_TIMEOUT;
-    if (transfer && sessionNow() - transfer.activity > timeout) {
+    if (transfer && !app.restartingAt && !app.disconnectedAt && sessionNow() - transfer.activity > timeout) {
       tryControl({ type: 'cancel', transfer: transfer.transfer });
       cancelOne(transfer.transfer, direction === 'incoming' ? 'File source is not responding' : 'File destination is not responding');
     }
