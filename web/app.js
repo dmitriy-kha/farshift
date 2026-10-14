@@ -43,6 +43,7 @@ const TRANSFER_IDLE_TIMEOUT = 30000;
 const TRANSFER_WRITE_TIMEOUT = 60000;
 const SIGNAL_OPEN_TIMEOUT = 15000;
 const CHANNEL_OPEN_TIMEOUT = 45000;
+const DATA_CHANNEL_OPEN_TIMEOUT = 15000;
 const ICE_RESTART_TIMEOUT = 20000;
 const MAX_ICE_RESTARTS = 2;
 const DEFAULT_TTL = 60 * 60;
@@ -61,13 +62,13 @@ const app = {
   serverOffset: 0, serverExpiresAt: 0, serverPairingDeadline: 0,
   lifetime: null, lifetimeConfirmed: false,
   signalingAt: 0, connectingAt: 0, remoteCandidates: [],
-  ice: { local: 0, remote: 0, public: 0, stunFailed: false },
+  ice: { local: 0, remote: 0, reflexive: 0, errors: [] },
   clock: 0, files: new Map(), local: new Map(), created: new Set(), expanded: new Set(), replace: null, outgoing: null,
   incoming: null, folderDownload: null, directoryImport: null,
   preparingDownload: false, receivingDone: false, disconnectedAt: 0,
   controlQueue: [], urgentControlQueue: [], controlQueueBytes: 0, sendingControl: false,
   speedTest: null, speedRates: { upload: null, download: null }, lastSpeedTest: 0,
-  restartingAt: 0, restartAttempts: 0, restartBusy: false, remoteIceGeneration: 0, iceGeneration: 0,
+  restartingAt: 0, restartAttempts: 0, restartBusy: false, remoteIceGeneration: 0, iceGeneration: 0, iceUfrag: '',
   routeAt: 0, routeBusy: false,
 };
 const element = id => document.getElementById(id);
@@ -272,10 +273,11 @@ function closeSession(message = '') {
   app.serverOffset = app.serverExpiresAt = app.serverPairingDeadline = 0;
   app.lifetime = null; app.lifetimeConfirmed = false;
   app.signalingAt = app.connectingAt = 0; app.remoteCandidates = [];
-  app.ice = { local: 0, remote: 0, public: 0, stunFailed: false };
+  app.ice = { local: 0, remote: 0, reflexive: 0, errors: [] };
   app.preparingDownload = app.receivingDone = false; app.disconnectedAt = 0;
   app.restartingAt = app.restartAttempts = app.remoteIceGeneration = app.iceGeneration = 0;
   app.restartBusy = app.routeBusy = false; app.routeAt = 0;
+  app.iceUfrag = '';
   app.speedRates = { upload: null, download: null }; updateSpeedUI(); hidden('speed-row', true);
   showCode(''); text('files', ''); text('timer', 'TTL --:--');
   clearJoinCode();
@@ -461,10 +463,9 @@ function directConnectionFailure() {
   }
   if (!app.ice.local) return 'This browser provided no direct network addresses. Check its WebRTC settings.';
   if (!app.ice.remote) return 'The other device provided no direct network addresses. Check its WebRTC settings.';
-  if (app.ice.stunFailed && !app.ice.public) {
-    return 'STUN did not discover a public address and no direct route was found. Try the same Wi-Fi or another network.';
-  }
-  return 'No direct route was found. NAT, firewall or VPN may block it. Try the same Wi-Fi or another network.';
+  const counts = `ICE candidates: local ${app.ice.local}, remote ${app.ice.remote}, STUN ${app.ice.reflexive}.`;
+  const errors = app.ice.errors.length ? ` STUN errors: ${app.ice.errors.map(error => `${error.code} (${error.url})`).join(', ')}.` : '';
+  return `No direct route was found. ${counts}${errors} NAT, firewall or VPN may block the route.`;
 }
 function connectionProgress() {
   const pc = app.pc;
@@ -490,15 +491,26 @@ function setupPeer() {
   app.pc = pc;
   pc.onicecandidate = event => {
     if (!current(generation)) return;
+    const localUfrag = pc.localDescription?.sdp.match(/^a=ice-ufrag:(\S+)/m)?.[1];
+    const candidateUfrag = event.candidate?.usernameFragment
+      || event.candidate?.candidate.match(/(?:^|\s)ufrag\s+(\S+)/)?.[1];
+    // Gathering callbacks from a previous restart must never be relabeled.
+    if (!app.iceUfrag || (candidateUfrag ? candidateUfrag !== app.iceUfrag : localUfrag !== app.iceUfrag)) return;
+    if (!event.candidate && pc.iceGatheringState !== 'complete') return;
     if (event.candidate) {
       app.ice.local++;
-      if (event.candidate.type === 'srflx' || /\btyp srflx\b/.test(event.candidate.candidate)) app.ice.public++;
+      if (event.candidate.type === 'srflx' || /\btyp srflx\b/.test(event.candidate.candidate)) app.ice.reflexive++;
     }
     if (!app.ws && app.channel?.readyState === 'open') return;
     signalSend({ type: 'candidate', candidate: event.candidate?.toJSON() ?? null, generation: app.iceGeneration }, generation)
       .catch(() => { if (current(generation)) closeSession('Could not send WebRTC connection details.'); });
   };
-  pc.onicecandidateerror = () => { if (current(generation)) app.ice.stunFailed = true; };
+  pc.onicecandidateerror = event => {
+    if (!current(generation) || typeof event.url !== 'string' || !/^stuns?:/.test(event.url)) return;
+    const code = Number.isInteger(event.errorCode) ? event.errorCode : 0;
+    const url = event.url.slice(0, 200);
+    if (app.ice.errors.length < 8 && !app.ice.errors.some(error => error.code === code && error.url === url)) app.ice.errors.push({ code, url });
+  };
   pc.onicegatheringstatechange = () => { if (current(generation)) connectionProgress(); };
   pc.oniceconnectionstatechange = () => {
     if (!current(generation)) return;
@@ -517,9 +529,10 @@ function setupPeer() {
       case 'disconnected':
         if (!app.disconnectedAt) app.disconnectedAt = sessionNow();
         status('Connection interrupted'); text('route', 'direct connection interrupted');
-        notice('Direct connection interrupted. Waiting up to 30 seconds for the route to recover.'); renderFiles(); break;
+        notice('Direct connection interrupted. Preparing to restore the route.'); renderFiles(); break;
       case 'connected':
         app.disconnectedAt = 0;
+        if (!app.channelStarted) app.connectingAt = sessionNow();
         if (pc.signalingState === 'stable') app.restartingAt = 0;
         for (const transfer of [app.outgoing, app.incoming]) if (transfer) transfer.activity = sessionNow();
         if (channelsOpen()) {
@@ -536,6 +549,14 @@ function localSdp(pc) {
   const sdp = pc.localDescription?.sdp;
   if (typeof sdp !== 'string' || byteLength(sdp) > 128 * 1024 || !sdp.includes('a=fingerprint:')) throw Error('Missing DTLS fingerprint');
   return sdp;
+}
+async function applyLocalDescription(pc, description, iceGeneration, generation, action) {
+  const ufrag = description.sdp?.match(/^a=ice-ufrag:(\S+)/m)?.[1];
+  if (!ufrag) throw new WebRTCError('The browser did not provide ICE credentials.');
+  if (!current(generation)) return;
+  app.iceGeneration = iceGeneration;
+  app.iceUfrag = ufrag;
+  await rtc(() => pc.setLocalDescription(description), action);
 }
 function validCandidate(candidate) {
   return candidate === null || (candidate && Object.getPrototypeOf(candidate) === Object.prototype
@@ -567,7 +588,7 @@ async function createOffer(generation) {
   attachChannel(dataChannel);
   const offer = await rtc(() => pc.createOffer(), 'Preparing connection details');
   if (!current(generation)) return;
-  await rtc(() => pc.setLocalDescription(offer), 'Applying local connection details');
+  await applyLocalDescription(pc, offer, 0, generation, 'Applying local connection details');
   if (current(generation)) await signalSend({ type: 'offer', sdp: localSdp(pc), generation: 0 }, generation);
 }
 function recoverConnection() {
@@ -581,6 +602,7 @@ function recoverConnection() {
   }
   app.restartAttempts++;
   app.restartingAt = sessionNow();
+  if (!app.channelStarted) app.connectingAt = app.restartingAt;
   status('Restoring direct connection'); text('route', 'restoring direct connection');
   notice('Trying a new direct route. Keep both devices online.');
   const generation = app.generation;
@@ -593,12 +615,12 @@ function recoverConnection() {
   app.restartBusy = true;
   const pc = app.pc;
   (async () => {
-    app.iceGeneration++;
+    const iceGeneration = app.iceGeneration + 1;
     const offer = await rtc(() => pc.createOffer({ iceRestart: true }), 'Preparing a new direct route');
     if (!current(generation)) return;
     app.restartingAt = sessionNow();
-    await rtc(() => pc.setLocalDescription(offer), 'Applying a new direct route');
-    if (current(generation)) await signalSend({ type: 'offer', sdp: localSdp(pc), generation: app.iceGeneration }, generation);
+    await applyLocalDescription(pc, offer, iceGeneration, generation, 'Applying a new direct route');
+    if (current(generation)) await signalSend({ type: 'offer', sdp: localSdp(pc), generation: iceGeneration }, generation);
   })().catch(error => {
     if (current(generation)) closeSession(errorText(error));
   }).finally(() => { if (current(generation)) app.restartBusy = false; });
@@ -651,15 +673,16 @@ async function handleSignal(value, generation) {
     if (pc.remoteDescription ? value.generation !== app.remoteIceGeneration + 1 : value.generation !== 0) throw Error('Invalid connection offer');
     if (value.generation > 0) {
       app.restartingAt = sessionNow();
+      if (!app.channelStarted) app.connectingAt = app.restartingAt;
       status('Restoring direct connection');
     }
-    app.remoteIceGeneration = app.iceGeneration = value.generation;
+    app.remoteIceGeneration = value.generation;
     await rtc(() => pc.setRemoteDescription({ type: 'offer', sdp }), 'Applying the other device\'s connection details');
     if (!current(generation)) return;
     await applyCandidates(pc, generation);
     const answer = await rtc(() => pc.createAnswer(), 'Preparing the connection response');
     if (!current(generation)) return;
-    await rtc(() => pc.setLocalDescription(answer), 'Applying the connection response');
+    await applyLocalDescription(pc, answer, value.generation, generation, 'Applying the connection response');
     if (current(generation)) await signalSend({ type: 'answer', sdp: localSdp(pc), generation: value.generation }, generation);
   } else if (value.type === 'answer' && app.role === 'a') {
     if (!app.pc || app.pc.signalingState !== 'have-local-offer' || value.generation !== app.iceGeneration) throw Error('Invalid answer');
@@ -1573,8 +1596,15 @@ function tick() {
   if (app.signalingAt && sessionNow() - app.signalingAt > SIGNAL_OPEN_TIMEOUT) {
     closeSession('The pairing server did not issue a code within 15 seconds. Check your connection and try again.'); return;
   }
-  if (app.connectingAt && sessionNow() - app.connectingAt > CHANNEL_OPEN_TIMEOUT) {
-    if (!app.restartingAt) recoverConnection();
+  const connectionTimeout = app.pc?.connectionState === 'connected' ? DATA_CHANNEL_OPEN_TIMEOUT : CHANNEL_OPEN_TIMEOUT;
+  if (app.connectingAt && sessionNow() - app.connectingAt > connectionTimeout) {
+    if (!app.pc) { closeSession(directConnectionFailure()); return; }
+    if (!app.restartingAt) {
+      if (app.pc?.connectionState === 'connected' || ['connected', 'completed'].includes(app.pc?.iceConnectionState)) {
+        closeSession('A direct route was found, but both file channels did not open. Refresh both devices and try again.'); return;
+      }
+      recoverConnection();
+    }
     if (!app.pc) return;
   }
   if (app.restartingAt && sessionNow() - app.restartingAt > ICE_RESTART_TIMEOUT) {
