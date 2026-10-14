@@ -46,7 +46,10 @@ impl Default for Config {
             bind: "127.0.0.1:8080".into(),
             origin: "http://127.0.0.1:8080".into(),
             web_dir: "web".into(),
-            stun_urls: vec!["stun:stun.cloudflare.com:3478".into()],
+            stun_urls: vec![
+                "stun:stun.l.google.com:19302".into(),
+                "stun:global.stun.twilio.com:3478".into(),
+            ],
             max_rooms: MAX_PARTICIPANTS,
             max_connections: MAX_PARTICIPANTS,
         }
@@ -107,13 +110,10 @@ impl Config {
         Ok(c)
     }
     fn ice_servers(&self) -> Vec<IceServer> {
-        let mut result = Vec::new();
-        if !self.stun_urls.is_empty() {
-            result.push(IceServer {
-                urls: self.stun_urls.clone(),
-            });
-        }
-        result
+        self.stun_urls
+            .iter()
+            .map(|url| IceServer { urls: vec![url.clone()] })
+            .collect()
     }
 }
 fn urls(s: &str) -> Vec<String> {

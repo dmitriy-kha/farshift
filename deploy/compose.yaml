@@ -15,7 +15,7 @@ services:
     security_opt: [no-new-privileges:true]
     environment:
       FARSHIFT_ORIGIN: https://${FARSHIFT_DOMAIN:?Set FARSHIFT_DOMAIN in deploy/.env}
-      FARSHIFT_STUN_URLS: ${FARSHIFT_STUN_URLS-stun:stun.cloudflare.com:3478}
+      FARSHIFT_STUN_URLS: ${FARSHIFT_STUN_URLS-stun:stun.l.google.com:19302,stun:global.stun.twilio.com:3478}
       FARSHIFT_MAX_ROOMS: ${FARSHIFT_MAX_ROOMS:-32768}
       FARSHIFT_MAX_CONNECTIONS: ${FARSHIFT_MAX_CONNECTIONS:-32768}
 
