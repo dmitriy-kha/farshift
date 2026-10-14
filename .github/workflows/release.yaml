@@ -95,7 +95,6 @@ jobs:
           DEPLOY_KNOWN_HOSTS: ${{ vars.DEPLOY_KNOWN_HOSTS }}
           FARSHIFT_DOMAIN: ${{ vars.FARSHIFT_DOMAIN }}
           FARSHIFT_ACME_EMAIL: ${{ secrets.FARSHIFT_ACME_EMAIL }}
-          FARSHIFT_STUN_URLS: ${{ vars.FARSHIFT_STUN_URLS }}
           FARSHIFT_MAX_ROOMS: ${{ vars.FARSHIFT_MAX_ROOMS }}
           FARSHIFT_MAX_CONNECTIONS: ${{ vars.FARSHIFT_MAX_CONNECTIONS }}
         run: bash deploy/github-release.sh deploy

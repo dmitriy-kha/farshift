@@ -1,10 +1,11 @@
 // Sizes are in bytes. Both devices must use the same packet size.
 export const CHUNK = 16 * 1024;                 // Payload per channel packet.
-export const TRANSFER_WINDOW = 4 * 1024 * 1024; // Maximum unacknowledged payload.
-export const WRITE_BATCH = 256 * 1024;          // File read/write and worker batch.
-export const ACK_BYTES = 64 * 1024;             // Committed bytes between acknowledgements.
-export const CHANNEL_HIGH_WATER = 256 * 1024;   // Pause sending above this buffer size.
-export const CHANNEL_LOW_WATER = 64 * 1024;     // Resume when the buffer falls to this size.
+export const TRANSFER_WINDOW = 16 * 1024 * 1024; // Maximum unacknowledged payload.
+export const WRITE_BATCH = 1024 * 1024;          // File read/write and worker batch.
+export const ACK_BYTES = 256 * 1024;             // Consumed bytes between acknowledgements.
+export const CHANNEL_HIGH_WATER = 1024 * 1024;   // Pause sending above this buffer size.
+export const CHANNEL_LOW_WATER = 256 * 1024;     // Resume when the buffer falls to this size.
+export const WRITE_DELAY = 16;                  // Maximum batch accumulation time in milliseconds.
 
 // Batches and acknowledgements must align with packets and fit inside the window.
 // Worker batches must also be multiples of 16 KiB for existing workers.

@@ -35,7 +35,7 @@ CMD ["acme.sh", "--help"]
 FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 AS runtime
 
 RUN apk upgrade --no-cache \
-    && apk add --no-cache libgcc \
+    && apk add --no-cache libgcc coturn \
     && addgroup -g 10001 -S farshift \
     && adduser -u 10001 -S -D -H -G farshift farshift
 
